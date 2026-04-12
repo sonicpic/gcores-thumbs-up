@@ -6,7 +6,8 @@
   "scripts": {
     "gcores:login": "node scripts/gcores-playwright.js login",
     "gcores:run": "node scripts/gcores-playwright.js run",
-    "gcores:check": "node --check scripts/gcores-playwright.js"
+    "gcores:check": "node --check scripts/gcores-playwright.js",
+    "gcores:monitor": "node scripts/gcores-session-monitor.js"
   },
   "dependencies": {
     "playwright": "^1.59.1"

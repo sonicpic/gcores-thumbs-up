@@ -1,3 +1,4 @@
 node_modules/
 .gcores-playwright/
 README.private.md
+gcores-playwright.local.json

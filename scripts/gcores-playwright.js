@@ -6,6 +6,7 @@ const { chromium } = require('playwright');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const CONFIG_PATH = path.join(PROJECT_ROOT, 'gcores-playwright.config.json');
+const LOCAL_CONFIG_PATH = path.join(PROJECT_ROOT, 'gcores-playwright.local.json');
 const FEEDS_URL = 'https://www.gcores.com/feeds';
 const PROCESSED_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -228,7 +229,9 @@ function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
     writeJsonFile(CONFIG_PATH, DEFAULT_CONFIG);
   }
-  return sanitizeConfig(readJsonFile(CONFIG_PATH));
+  const baseConfig = readJsonFile(CONFIG_PATH);
+  const localConfig = fs.existsSync(LOCAL_CONFIG_PATH) ? readJsonFile(LOCAL_CONFIG_PATH) : {};
+  return sanitizeConfig(deepMerge(baseConfig, localConfig));
 }
 
 function loadState(config) {
