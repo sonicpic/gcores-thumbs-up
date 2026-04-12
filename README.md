@@ -1,66 +1,59 @@
-# GCORES Auto Like
+# GCORES 动态自动点赞
 
-Automate likes on the GCORES feeds page with Playwright.
+基于 Playwright 的机核动态页自动点赞脚本。
 
-This repository currently includes:
-
-- `scripts/gcores-playwright.js`
-  Main automation entry for unattended runs.
-- `gcores-playwright.config.json`
-  Runtime configuration.
-- `gcores-feeds-auto-like.user.js`
-  Legacy Tampermonkey script kept for reference.
-
-## Features
-
-- Persistent login via Playwright browser profile
-- Current-page-only processing
-- Filterable allow/deny rules
-- Unlimited mode for age and like caps
-- Local run state and cooldown tracking
-- Suitable for scheduled Windows execution
-
-## Quick Start
+## 安装
 
 ```powershell
 npm install
 npx playwright install chromium
+```
+
+## 使用
+
+首次登录：
+
+```powershell
 npm run gcores:login
+```
+
+执行一轮：
+
+```powershell
 npm run gcores:run
 ```
 
-`gcores:login` opens a browser for manual login and saves the session locally.  
-`gcores:run` opens `https://www.gcores.com/feeds`, scans visible feed items, likes matched content, writes state, and exits.
+后台定时执行：
 
-## Configuration
+```powershell
+npm run gcores:daemon
+npm run gcores:daemon:status
+npm run gcores:daemon:stop
+```
 
-Edit `gcores-playwright.config.json` to adjust:
+自定义参数：
 
-- delays and timeouts
-- per-run / per-day limits
-- allow / deny filters
-- storage paths
-- headless mode
+```powershell
+npm run gcores:daemon -- --interval-minutes 15
+npm run gcores:daemon -- --interval-minutes 15 --pushplus off
+```
 
-Default behavior is intentionally open:
+## 默认行为
 
+- 只处理当前页已渲染出的动态
+- `daemon.intervalMinutes = 30`
 - `maxLikesPerRun = 0`
 - `maxLikesPerDay = 0`
 - `maxAgeHours = 0`
 - `allowEntryTypes = []`
 - `onlyUnliked = true`
+- `notifications.enabled = true`
 
-## Data Files
+## 通知
 
-Generated local files are stored under `.gcores-playwright/` and are ignored by Git.
+如果配置了 `notifications.pushplusToken`，每次真实点赞尝试的结果都会通过 PushPlus 推送。
 
-Typical files:
+## 说明
 
-- browser profile
-- run state
-- last error screenshot
-
-## Notes
-
-- The Playwright workflow is the recommended path for unattended execution.
-- The Tampermonkey userscript is retained as a legacy alternative for foreground browser use.
+- 本地数据保存在 `.gcores-playwright/`
+- `gcores-feeds-auto-like.user.js` 为旧版 Tampermonkey 脚本，仅保留参考

@@ -1,5 +1,5 @@
 {
-  "headless": true,
+  "headless": false,
   "storage": {
     "userDataDir": ".gcores-playwright/profile",
     "stateFile": ".gcores-playwright/state.json",
@@ -27,6 +27,12 @@
       7000
     ],
     "cooldownAfterBlockMs": 3600000
+  },
+  "daemon": {
+    "intervalMinutes": 30
+  },
+  "notifications": {
+    "enabled": true
   },
   "filters": {
     "allowAuthors": [],

@@ -7,7 +7,9 @@
     "gcores:login": "node scripts/gcores-playwright.js login",
     "gcores:run": "node scripts/gcores-playwright.js run",
     "gcores:check": "node --check scripts/gcores-playwright.js",
-    "gcores:monitor": "node scripts/gcores-session-monitor.js"
+    "gcores:daemon": "node scripts/gcores-daemon.js start",
+    "gcores:daemon:stop": "node scripts/gcores-daemon.js stop",
+    "gcores:daemon:status": "node scripts/gcores-daemon.js status"
   },
   "dependencies": {
     "playwright": "^1.59.1"

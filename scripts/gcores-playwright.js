@@ -3,49 +3,11 @@ const path = require('path');
 const process = require('process');
 const readline = require('readline/promises');
 const { chromium } = require('playwright');
+const { PROJECT_ROOT, loadConfig: loadUnifiedConfig } = require('./lib/app-config');
 
-const PROJECT_ROOT = path.resolve(__dirname, '..');
-const CONFIG_PATH = path.join(PROJECT_ROOT, 'gcores-playwright.config.json');
-const LOCAL_CONFIG_PATH = path.join(PROJECT_ROOT, 'gcores-playwright.local.json');
 const FEEDS_URL = 'https://www.gcores.com/feeds';
+const PUSHPLUS_API = 'https://www.pushplus.plus/send';
 const PROCESSED_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
-
-const DEFAULT_CONFIG = {
-  headless: true,
-  storage: {
-    userDataDir: '.gcores-playwright/profile',
-    stateFile: '.gcores-playwright/state.json',
-    errorScreenshotFile: '.gcores-playwright/last-error.png',
-  },
-  browser: {
-    viewport: { width: 1600, height: 2200 },
-  },
-  run: {
-    navigationTimeoutMs: 45000,
-    waitForFeedMs: 15000,
-    clickTimeoutMs: 8000,
-    maxConsecutiveErrors: 3,
-  },
-  limits: {
-    maxLikesPerRun: 0,
-    maxLikesPerDay: 0,
-  },
-  timing: {
-    actionDelayMsRange: [2500, 7000],
-    cooldownAfterBlockMs: 60 * 60 * 1000,
-  },
-  filters: {
-    allowAuthors: [],
-    allowTopics: [],
-    allowKeywords: [],
-    allowEntryTypes: [],
-    denyAuthors: [],
-    denyTopics: [],
-    denyKeywords: [],
-    maxAgeHours: 0,
-    onlyUnliked: true,
-  },
-};
 
 const DEFAULT_STATE = {
   processed: {},
@@ -125,47 +87,6 @@ function clampNumber(value, fallback, minValue) {
   return number;
 }
 
-function sanitizeRange(value, fallback) {
-  const range = Array.isArray(value) ? value.slice(0, 2) : fallback.slice();
-  const minValue = clampNumber(range[0], fallback[0], 0);
-  const maxValue = clampNumber(range[1], fallback[1], minValue);
-  return [Math.min(minValue, maxValue), Math.max(minValue, maxValue)];
-}
-
-function sanitizeConfig(config) {
-  const merged = deepMerge(DEFAULT_CONFIG, isObject(config) ? config : {});
-  merged.headless = Boolean(merged.headless);
-  merged.storage.userDataDir = cleanText(merged.storage.userDataDir || DEFAULT_CONFIG.storage.userDataDir);
-  merged.storage.stateFile = cleanText(merged.storage.stateFile || DEFAULT_CONFIG.storage.stateFile);
-  merged.storage.errorScreenshotFile = cleanText(
-    merged.storage.errorScreenshotFile || DEFAULT_CONFIG.storage.errorScreenshotFile
-  );
-  merged.browser.viewport.width = clampNumber(merged.browser.viewport.width, DEFAULT_CONFIG.browser.viewport.width, 800);
-  merged.browser.viewport.height = clampNumber(merged.browser.viewport.height, DEFAULT_CONFIG.browser.viewport.height, 600);
-  merged.run.navigationTimeoutMs = clampNumber(merged.run.navigationTimeoutMs, DEFAULT_CONFIG.run.navigationTimeoutMs, 5000);
-  merged.run.waitForFeedMs = clampNumber(merged.run.waitForFeedMs, DEFAULT_CONFIG.run.waitForFeedMs, 5000);
-  merged.run.clickTimeoutMs = clampNumber(merged.run.clickTimeoutMs, DEFAULT_CONFIG.run.clickTimeoutMs, 1000);
-  merged.run.maxConsecutiveErrors = clampNumber(merged.run.maxConsecutiveErrors, DEFAULT_CONFIG.run.maxConsecutiveErrors, 1);
-  merged.limits.maxLikesPerRun = clampNumber(merged.limits.maxLikesPerRun, DEFAULT_CONFIG.limits.maxLikesPerRun, 0);
-  merged.limits.maxLikesPerDay = clampNumber(merged.limits.maxLikesPerDay, DEFAULT_CONFIG.limits.maxLikesPerDay, 0);
-  merged.timing.actionDelayMsRange = sanitizeRange(merged.timing.actionDelayMsRange, DEFAULT_CONFIG.timing.actionDelayMsRange);
-  merged.timing.cooldownAfterBlockMs = clampNumber(
-    merged.timing.cooldownAfterBlockMs,
-    DEFAULT_CONFIG.timing.cooldownAfterBlockMs,
-    1000
-  );
-  merged.filters.allowAuthors = normalizeStringList(merged.filters.allowAuthors);
-  merged.filters.allowTopics = normalizeStringList(merged.filters.allowTopics);
-  merged.filters.allowKeywords = normalizeStringList(merged.filters.allowKeywords);
-  merged.filters.allowEntryTypes = normalizeStringList(merged.filters.allowEntryTypes);
-  merged.filters.denyAuthors = normalizeStringList(merged.filters.denyAuthors);
-  merged.filters.denyTopics = normalizeStringList(merged.filters.denyTopics);
-  merged.filters.denyKeywords = normalizeStringList(merged.filters.denyKeywords);
-  merged.filters.maxAgeHours = clampNumber(merged.filters.maxAgeHours, DEFAULT_CONFIG.filters.maxAgeHours, 0);
-  merged.filters.onlyUnliked = Boolean(merged.filters.onlyUnliked);
-  return merged;
-}
-
 function localDateKey(timestamp) {
   const date = new Date(timestamp);
   const year = String(date.getFullYear());
@@ -226,12 +147,7 @@ function writeJsonFile(filePath, value) {
 }
 
 function loadConfig() {
-  if (!fs.existsSync(CONFIG_PATH)) {
-    writeJsonFile(CONFIG_PATH, DEFAULT_CONFIG);
-  }
-  const baseConfig = readJsonFile(CONFIG_PATH);
-  const localConfig = fs.existsSync(LOCAL_CONFIG_PATH) ? readJsonFile(LOCAL_CONFIG_PATH) : {};
-  return sanitizeConfig(deepMerge(baseConfig, localConfig));
+  return loadUnifiedConfig();
 }
 
 function loadState(config) {
@@ -246,8 +162,12 @@ function saveState(config, state) {
   writeJsonFile(projectPath(config.storage.stateFile), sanitizeState(state));
 }
 
+function formatTimestamp(timestamp = Date.now()) {
+  return new Date(timestamp).toLocaleString('zh-CN', { hour12: false });
+}
+
 function logLine(message) {
-  console.log(`[${new Date().toLocaleString('zh-CN', { hour12: false })}] ${message}`);
+  console.log(`[${formatTimestamp()}] ${message}`);
 }
 
 function sleep(ms) {
@@ -279,6 +199,77 @@ function hasReachedDailyLimit(state, config) {
 
 function hasReachedRunLimit(stats, config) {
   return isPositiveLimit(config.limits.maxLikesPerRun) && stats.liked >= config.limits.maxLikesPerRun;
+}
+
+function getPushPlusToken(config) {
+  return cleanText(process.env.PUSHPLUS_TOKEN || (config.notifications && config.notifications.pushplusToken) || '');
+}
+
+async function sendPushPlusMessage({ token, title, content, template = 'markdown' }) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 10000) : null;
+  try {
+    const response = await fetch(PUSHPLUS_API, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        token,
+        title,
+        content,
+        template,
+      }),
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || !payload || payload.code !== 200) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function buildPushPlusLikeMessage({ item, resultText, detailText, stats }) {
+  const lines = [
+    '# GCORES 点赞结果',
+    '',
+    `- 时间: ${formatTimestamp()}`,
+    `- 结果: ${resultText}`,
+    `- 标题: ${cleanText(item.title || item.itemKey)}`,
+    `- 链接: ${cleanText(item.url || '') || '未知'}`,
+    `- 类型: ${cleanText(item.targetType || '未知')}`,
+    `- 本轮统计: 扫描 ${stats.scanned} / 命中 ${stats.matched} / 成功 ${stats.liked} / 跳过 ${stats.skipped}`,
+  ];
+  if (detailText) {
+    lines.push(`- 详情: ${cleanText(detailText)}`);
+  }
+  return lines.join('\n');
+}
+
+async function notifyLikeResult(config, payload) {
+  // 通知是附加能力，任何异常都不能反向影响点赞主流程。
+  if (!config.notifications || config.notifications.enabled === false) {
+    return false;
+  }
+  const token = getPushPlusToken(config);
+  if (!token) {
+    return false;
+  }
+  try {
+    await sendPushPlusMessage({
+      token,
+      title: `GCORES 点赞${payload.resultText}`,
+      content: buildPushPlusLikeMessage(payload),
+    });
+    return true;
+  } catch (error) {
+    logLine(`PushPlus 推送失败：${cleanText(error && error.message ? error.message : error)}`);
+    return false;
+  }
 }
 
 function markProcessed(state, itemKey, status) {
@@ -523,6 +514,7 @@ async function pageDomAction(page, action, payload = {}) {
       });
     }
     function collect() {
+      // 只从当前页主内容区提取可见点赞按钮，避免误扫侧栏或页脚。
       const scope =
         document.querySelector('.pageContainer .flowLayout_main') ||
         document.querySelector('.flowLayout_main') ||
@@ -793,16 +785,34 @@ async function runOnce(config) {
           markProcessed(state, item.itemKey, result.mode || 'liked');
           incrementDailyLikes(state);
           logLine(`已点赞：${item.title}`);
+          await notifyLikeResult(config, {
+            item,
+            resultText: '成功',
+            detailText: result.mode || 'liked',
+            stats,
+          });
         }
       } catch (error) {
         if (error instanceof BlockedRequestError) {
           state.cooldown.blockedUntil = Date.now() + config.timing.cooldownAfterBlockMs;
           setLastError(state, `触发风控，进入冷却期（HTTP ${error.status}）`, { status: error.status });
+          await notifyLikeResult(config, {
+            item,
+            resultText: '失败',
+            detailText: `触发风控（HTTP ${error.status}）`,
+            stats,
+          });
           throw error;
         }
         stats.consecutiveErrors += 1;
         setLastError(state, error.message || '点赞失败', { itemKey: item.itemKey, title: item.title });
         logLine(`点赞失败：${item.title} | ${error.message}`);
+        await notifyLikeResult(config, {
+          item,
+          resultText: '失败',
+          detailText: error.message || '点赞失败',
+          stats,
+        });
         if (stats.consecutiveErrors >= config.run.maxConsecutiveErrors) {
           break;
         }
@@ -849,18 +859,60 @@ async function runOnce(config) {
   }
 }
 
+function parseBooleanOption(value) {
+  const normalized = cleanText(value).toLowerCase();
+  if (['1', 'true', 'on', 'yes', 'y'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'off', 'no', 'n'].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function parseArgs(argv) {
+  const result = {
+    command: argv[0] || '',
+    help: false,
+    pushplusEnabled: null,
+  };
+  const optionArgs = argv.slice(result.command ? 1 : 0);
+
+  for (let index = 0; index < optionArgs.length; index += 1) {
+    const value = optionArgs[index];
+    if (value === '--help' || value === '-h') {
+      result.help = true;
+      continue;
+    }
+    if (value === '--pushplus') {
+      const parsed = parseBooleanOption(optionArgs[index + 1]);
+      if (parsed !== null) {
+        result.pushplusEnabled = parsed;
+      }
+      index += 1;
+    }
+  }
+
+  return result;
+}
+
 function printUsage() {
-  console.log('Usage: node scripts/gcores-playwright.js <login|run>');
+  console.log('Usage: node scripts/gcores-playwright.js <login|run> [--pushplus on|off]');
 }
 
 async function main() {
-  const command = process.argv[2];
-  if (!command || ['-h', '--help', 'help'].includes(command)) {
+  const args = parseArgs(process.argv.slice(2));
+  const command = args.command;
+  if (!command || args.help || ['help', '-h', '--help'].includes(command)) {
     printUsage();
     return;
   }
 
   const config = loadConfig();
+  // 命令行参数优先级高于配置文件，方便临时覆盖而不改本地文件。
+  if (args.pushplusEnabled !== null) {
+    config.notifications.enabled = args.pushplusEnabled;
+  }
   if (command === 'login') {
     await runLogin(config);
     return;
