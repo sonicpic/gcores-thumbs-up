@@ -1,0 +1,95 @@
+{
+  "browser": {
+    "headless": true,
+    "channel": "chromium",
+    "locale": "zh-CN",
+    "timezoneId": "Asia/Shanghai",
+    "viewport": {
+      "width": 1440,
+      "height": 2000
+    }
+  },
+  "paths": {
+    "stateDir": ".gcores-auto-like",
+    "stateFile": ".gcores-auto-like/state.json",
+    "sessionFile": ".gcores-auto-like/session.json",
+    "logFile": ".gcores-auto-like/worker.log",
+    "errorScreenshotFile": ".gcores-auto-like/last-error.png",
+    "lockFile": ".gcores-auto-like/run.lock"
+  },
+  "session": {
+    "sources": [
+      {
+        "type": "profile",
+        "label": "旧版 Playwright Chromium profile",
+        "profileDir": "D:/Workspace/gcores-thumbs-up/.gcores-playwright/profile",
+        "channel": "chromium"
+      },
+      {
+        "type": "profile",
+        "label": "本机 Edge（Default）",
+        "profileDir": "C:/Users/zhihongpan/AppData/Local/Microsoft/Edge/User Data",
+        "channel": "msedge"
+      }
+    ]
+  },
+  "target": {
+    "feedsUrl": "https://www.gcores.com/feeds"
+  },
+  "ui": {
+    "port": 7317,
+    "openBrowser": true
+  },
+  "run": {
+    "navigationTimeoutMs": 45000,
+    "waitForFeedMs": 20000,
+    "clickTimeoutMs": 8000,
+    "maxConsecutiveErrors": 3,
+    "navigationRetries": 3,
+    "maxRunMs": 300000,
+    "screenshotOnError": true
+  },
+  "limits": {
+    "maxLikesPerRun": 0,
+    "maxLikesPerDay": 0
+  },
+  "timing": {
+    "actionDelayMsRange": [
+      2500,
+      7000
+    ],
+    "cooldownAfterBlockMs": 3600000,
+    "jitterMsRange": [
+      0,
+      120000
+    ]
+  },
+  "schedule": {
+    "intervalMinutes": 30,
+    "taskName": "GcoresAutoLike"
+  },
+  "notifications": {
+    "enabled": true,
+    "onLike": false,
+    "onFailure": true,
+    "onSessionExpired": true,
+    "onRunSummary": false,
+    "pushplusToken": ""
+  },
+  "filters": {
+    "allowAuthors": [],
+    "allowTopics": [],
+    "allowKeywords": [],
+    "allowEntryTypes": [],
+    "denyAuthors": [],
+    "denyTopics": [],
+    "denyKeywords": [],
+    "maxAgeHours": 0,
+    "onlyUnliked": true
+  },
+  "logging": {
+    "level": "info",
+    "maxBytes": 2097152,
+    "keepFiles": 3
+  }
+}

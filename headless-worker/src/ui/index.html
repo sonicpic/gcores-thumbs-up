@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GCORES 自动点赞 · 控制台</title>
+<style>
+  :root{
+    --bg:#f4f5f6; --card:#ffffff; --line:#e3e5e9; --line-strong:#cfd3da;
+    --text:#1c1e21; --muted:#666b73; --faint:#8b9099;
+    --accent:#0f6e56; --accent-soft:#e1f5ee;
+    --danger:#a32d2d; --danger-soft:#fcebeb;
+    --warn:#8a5a0b; --warn-soft:#faeeda;
+    --ok:#2f6b17; --ok-soft:#eaf3de;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1000px;margin:0 auto;padding:22px 20px 48px}
+  header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+  h1{font-size:17px;font-weight:500;margin:0}
+  .sub{color:var(--faint);font-size:12.5px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+  .card h2{font-size:13px;font-weight:500;margin:0 0 10px;color:var(--muted)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+  .stat{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#fcfcfd}
+  .stat .k{font-size:12px;color:var(--faint)}
+  .stat .v{font-size:15px;font-weight:500;margin-top:2px;word-break:break-all}
+  .pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:12px;font-weight:500}
+  .p-ok{background:var(--ok-soft);color:var(--ok)}
+  .p-warn{background:var(--warn-soft);color:var(--warn)}
+  .p-bad{background:var(--danger-soft);color:var(--danger)}
+  .p-idle{background:#eef0f2;color:var(--muted)}
+  button{
+    font:inherit;font-size:13px;padding:7px 14px;border-radius:8px;cursor:pointer;
+    border:1px solid var(--line-strong);background:#fff;color:var(--text);
+  }
+  button:hover:not(:disabled){border-color:var(--muted)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover:not(:disabled){background:#0b5b47}
+  button.ghost-danger{color:var(--danger);border-color:#e8bcbc}
+  button.ghost-danger:hover:not(:disabled){border-color:var(--danger)}
+  .actions{display:flex;gap:8px;flex-wrap:wrap}
+  .row{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin-bottom:8px}
+  .row label{color:var(--muted);font-size:13px}
+  input[type=text],input[type=number]{
+    width:100%;font:inherit;font-size:13px;padding:6px 9px;border:1px solid var(--line-strong);
+    border-radius:7px;background:#fff;color:var(--text);
+  }
+  input:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+  .hint{color:var(--faint);font-size:12px;margin-top:4px}
+  .checkline{display:flex;gap:16px;flex-wrap:wrap;margin:2px 0 10px}
+  .checkline label{display:flex;align-items:center;gap:6px;color:var(--text);font-size:13px}
+  pre.log{
+    margin:0;height:230px;overflow:auto;background:#1d2024;color:#dfe3e8;
+    border-radius:8px;padding:11px 13px;font:12px/1.55 ui-monospace,Consolas,"Cascadia Mono",monospace;
+    white-space:pre-wrap;word-break:break-all;
+  }
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media (max-width:760px){.split{grid-template-columns:1fr}.row{grid-template-columns:1fr}}
+  .toast{
+    position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
+    background:#1d2024;color:#fff;padding:9px 18px;border-radius:8px;font-size:13px;
+    opacity:0;pointer-events:none;transition:opacity .18s;
+  }
+  .toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>GCORES 自动点赞 · 控制台</h1>
+    <span class="sub" id="envline">加载中…</span>
+  </header>
+
+  <div class="card">
+    <h2>当前状态</h2>
+    <div class="grid" id="stats"></div>
+  </div>
+
+  <div class="card">
+    <h2>操作</h2>
+    <div class="actions">
+      <button class="primary" id="btn-dry">试运行（不点赞）</button>
+      <button class="primary" id="btn-run">立即点赞一轮</button>
+      <button id="btn-import">重新导入登录态</button>
+      <button id="btn-notify">测试通知</button>
+      <button id="btn-task-install">注册计划任务</button>
+      <button id="btn-task-start">启用计划任务</button>
+      <button id="btn-task-stop">停止计划任务</button>
+      <button id="btn-task-remove" class="ghost-danger">删除计划任务</button>
+    </div>
+    <div class="hint" id="actionhint">这些按钮等同于命令行里的 <code>npm run gc:dry / gc:run / gc:session:import</code>。</div>
+  </div>
+
+  <div class="card">
+    <h2>运行日志　<span class="pill p-idle" id="jobpill">空闲</span></h2>
+    <pre class="log" id="log">（暂无输出）</pre>
+  </div>
+
+  <div class="card">
+    <h2>设置</h2>
+    <div class="split">
+      <div>
+        <div class="row"><label>允许作者 ID</label><input type="text" id="f-allowAuthors" placeholder="逗号分隔，留空=不限"></div>
+        <div class="row"><label>允许话题</label><input type="text" id="f-allowTopics" placeholder="逗号分隔"></div>
+        <div class="row"><label>允许关键词</label><input type="text" id="f-allowKeywords" placeholder="逗号分隔"></div>
+        <div class="row"><label>允许内容类型</label><input type="text" id="f-allowEntryTypes" placeholder="articles,videos,radios,talks…"></div>
+        <div class="row"><label>屏蔽作者 ID</label><input type="text" id="f-denyAuthors"></div>
+        <div class="row"><label>屏蔽话题</label><input type="text" id="f-denyTopics"></div>
+        <div class="row"><label>屏蔽关键词</label><input type="text" id="f-denyKeywords"></div>
+      </div>
+      <div>
+        <div class="row"><label>只看 N 小时内</label><input type="number" id="f-maxAgeHours" min="0" placeholder="0 = 不限"></div>
+        <div class="row"><label>单轮最多点赞</label><input type="number" id="l-maxLikesPerRun" min="0" placeholder="0 = 不限"></div>
+        <div class="row"><label>每日最多点赞</label><input type="number" id="l-maxLikesPerDay" min="0" placeholder="0 = 不限"></div>
+        <div class="row"><label>调度间隔（分钟）</label><input type="number" id="s-interval" min="1"></div>
+        <div class="row"><label>动作间隔（毫秒）</label><input type="text" id="t-delay" placeholder="2500,7000"></div>
+        <div class="row"><label>风控冷却（分钟）</label><input type="number" id="t-cooldown" min="1"></div>
+      </div>
+    </div>
+    <div class="checkline">
+      <label><input type="checkbox" id="f-onlyUnliked"> 跳过已点过赞的</label>
+      <label><input type="checkbox" id="n-enabled"> 启用通知</label>
+      <label><input type="checkbox" id="n-onLike"> 点赞成功时通知</label>
+      <label><input type="checkbox" id="n-onFailure"> 出错时通知</label>
+      <label><input type="checkbox" id="n-onSessionExpired"> 登录失效时通知</label>
+      <label><input type="checkbox" id="n-onRunSummary"> 每轮汇报</label>
+    </div>
+    <div class="hint">提示：<b>允许</b>项只要命中任意一条就通过；<b>屏蔽</b>项一票否决。允许项全空 = 全部可见动态都收。</div>
+    <div class="actions" style="margin-top:12px">
+      <button class="primary" id="btn-save">保存设置</button>
+      <button class="ghost-danger" id="btn-reset">清空已处理记录</button>
+      <span class="hint" id="dirtyhint" style="align-self:center"></span>
+    </div>
+    <div class="hint">保存后立即生效，无需重启；计划任务下一轮就会用新规则。</div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const TOKEN = "__TOKEN__";
+let pollTimer = null;
+
+const $ = (id) => document.getElementById(id);
+
+function toast(msg){
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+async function api(path, options){
+  const res = await fetch(path, Object.assign({ headers: { 'x-gc-token': TOKEN } }, options || {}));
+  const data = await res.json().catch(() => ({ ok:false, message:'响应解析失败' }));
+  if (!data.ok && data.message) toast(data.message);
+  return data;
+}
+
+function post(path, body){
+  return api(path, { method:'POST', headers:{ 'content-type':'application/json', 'x-gc-token':TOKEN }, body: JSON.stringify(body || {}) });
+}
+
+function fmtTime(v){
+  if (!v) return '—';
+  if (typeof v === 'string' && v.startsWith('0001')) return '尚未运行';
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? String(v) : d.toLocaleString('zh-CN', { hour12:false });
+}
+
+function fmtCountdown(ts){
+  if (!ts) return '';
+  const left = Math.round((ts - Date.now()) / 60000);
+  return left > 0 ? `（还剩 ${left} 分钟）` : '（已到期）';
+}
+
+function statCard(key, valueHtml){
+  return `<div class="stat"><div class="k">${key}</div><div class="v">${valueHtml}</div></div>`;
+}
+
+async function load(){
+  const data = await api('/api/overview');
+  if (!data.ok) return;
+  const o = data.overview;
+  render(o);
+  renderJob(data.job);
+}
+
+function render(o){
+  $('envline').textContent = `Node ${o.runtime.node} · ${o.runtime.platform} · ${o.runtime.sessionName}`;
+
+  const sessionPill = !o.session.present ? '<span class="pill p-bad">缺失</span>'
+    : o.session.hasAuthCookie ? '<span class="pill p-ok">有效</span>' : '<span class="pill p-bad">无凭证</span>';
+  const sessionText = o.session.present && o.session.authExpiresAt
+    ? `约 ${o.session.authDaysLeft} 天后过期` : '未导入';
+
+  const t = o.task || {};
+  const taskRegistered = Boolean(t.registered);
+  let taskPill = taskRegistered ? `<span class="pill ${t.state === 'Ready' ? 'p-ok' : 'p-warn'}">${t.state}</span>` : '<span class="pill p-bad">未注册</span>';
+  const taskText = taskRegistered ? `下次 ${fmtTime(t.nextRunTime)}` : '尚未注册';
+
+  const cooling = o.store.cooldownUntil > Date.now();
+
+  $('stats').innerHTML = [
+    statCard('渲染方式', o.runtime.headless ? '无头 · 不依赖桌面 <span class="pill p-ok">推荐</span>' : '有头 · 依赖桌面 <span class="pill p-bad">脆弱</span>'),
+    statCard('登录态', `${sessionText} ${sessionPill}`),
+    statCard('计划任务', `${taskText} ${taskPill}`),
+    statCard('今日点赞', `${o.store.todayLikes} 条 · 累计 ${o.store.totalLikes} 条`),
+    statCard('已处理记录', `${o.store.processed} 条`),
+    statCard('冷却状态', cooling ? `冷却至 ${fmtTime(o.store.cooldownUntil)} <span class="pill p-warn">风控</span>` : '正常 <span class="pill p-ok">未触发</span>'),
+    statCard('最近一轮', o.store.lastRun ? `${o.store.lastRun.ok ? '成功' : '失败'} · 扫描 ${o.store.lastRun.stats.scanned} / 点赞 ${o.store.lastRun.stats.liked}` : '暂无记录'),
+    statCard('导入来源', (o.sources || []).map(s => `${s.label}: ${s.exists ? (s.locked ? '被占用' : '可用') : '不存在'}`).join('<br>') || '未配置'),
+  ].join('');
+
+  const c = o.config;
+  // formDirty 时跳过回写：用户没保存的编辑不能被自动刷新冲掉。
+  const fill = (id, v) => { const el = $(id); if (el && !formDirty && document.activeElement !== el) el.value = v; };
+  const check = (id, v) => { const el = $(id); if (el && !formDirty && document.activeElement !== el) el.checked = Boolean(v); };
+  const list = (v) => (v || []).join(', ');
+
+  fill('f-allowAuthors', list(c.filters.allowAuthors));
+  fill('f-allowTopics', list(c.filters.allowTopics));
+  fill('f-allowKeywords', list(c.filters.allowKeywords));
+  fill('f-allowEntryTypes', list(c.filters.allowEntryTypes));
+  fill('f-denyAuthors', list(c.filters.denyAuthors));
+  fill('f-denyTopics', list(c.filters.denyTopics));
+  fill('f-denyKeywords', list(c.filters.denyKeywords));
+  fill('f-maxAgeHours', c.filters.maxAgeHours);
+  fill('l-maxLikesPerRun', c.limits.maxLikesPerRun);
+  fill('l-maxLikesPerDay', c.limits.maxLikesPerDay);
+  fill('s-interval', c.schedule.intervalMinutes);
+  fill('t-delay', (c.timing.actionDelayMsRange || []).join(','));
+  fill('t-cooldown', Math.round((c.timing.cooldownAfterBlockMs || 3600000) / 60000));
+  check('f-onlyUnliked', c.filters.onlyUnliked);
+  check('n-enabled', c.notifications.enabled);
+  check('n-onLike', c.notifications.onLike);
+  check('n-onFailure', c.notifications.onFailure);
+  check('n-onSessionExpired', c.notifications.onSessionExpired);
+  check('n-onRunSummary', c.notifications.onRunSummary);
+
+  if (!o.config.notifications.hasToken) {
+    $('actionhint').innerHTML = '未配置 PushPlus token（config.local.json），通知按钮会失败。其余按钮等同于命令行里的 <code>npm run gc:dry / gc:run</code>。';
+  }
+}
+
+function renderJob(j){
+  const pill = $('jobpill');
+  if (j && j.running){
+    pill.className = 'pill p-warn';
+    pill.textContent = `运行中 · ${j.command}`;
+    setButtons(true);
+    if (j.lines && j.lines.length) setLog(j.lines.join('\n'));
+    if (!pollTimer) pollTimer = setInterval(pollJob, 800);
+  } else {
+    pill.className = 'pill p-idle';
+    pill.textContent = j && j.finishedAt ? `上次结束 · 退出码 ${j.exitCode}` : '空闲';
+    setButtons(false);
+    if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+    if (j && j.lines && j.lines.length) setLog(j.lines.join('\n'));
+  }
+}
+
+function setButtons(busy){
+  ['btn-dry','btn-run','btn-import','btn-notify','btn-task-install','btn-task-start','btn-task-stop','btn-task-remove','btn-save','btn-reset']
+    .forEach(id => { const el = $(id); if (el) el.disabled = busy; });
+}
+
+function setLog(text){
+  const el = $('log');
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+  el.textContent = text || '（暂无输出）';
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+async function pollJob(){
+  const data = await api('/api/job');
+  if (data.ok) renderJob(data.job);
+  if (data.ok && !data.job.running) load();
+}
+
+function num(id){ const v = Number($(id).value); return Number.isFinite(v) ? v : 0; }
+function csv(id){ return $(id).value.split(',').map(s => s.trim()).filter(Boolean); }
+function range(id, fallback){
+  const parts = $(id).value.split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n));
+  return parts.length === 2 ? parts : fallback;
+}
+
+async function save(){
+  const patch = {
+    filters: {
+      allowAuthors: csv('f-allowAuthors'), allowTopics: csv('f-allowTopics'),
+      allowKeywords: csv('f-allowKeywords'), allowEntryTypes: csv('f-allowEntryTypes'),
+      denyAuthors: csv('f-denyAuthors'), denyTopics: csv('f-denyTopics'), denyKeywords: csv('f-denyKeywords'),
+      maxAgeHours: num('f-maxAgeHours'), onlyUnliked: $('f-onlyUnliked').checked,
+    },
+    limits: { maxLikesPerRun: num('l-maxLikesPerRun'), maxLikesPerDay: num('l-maxLikesPerDay') },
+    schedule: { intervalMinutes: Math.max(1, num('s-interval')) },
+    timing: { actionDelayMsRange: range('t-delay', [2500, 7000]), cooldownAfterBlockMs: Math.max(1, num('t-cooldown')) * 60000 },
+    notifications: {
+      enabled: $('n-enabled').checked, onLike: $('n-onLike').checked, onFailure: $('n-onFailure').checked,
+      onSessionExpired: $('n-onSessionExpired').checked, onRunSummary: $('n-onRunSummary').checked,
+    },
+  };
+  const data = await post('/api/config', { patch });
+  if (data.ok) {
+    clearDirty();
+    toast(data.message || '设置已保存');
+    load();
+  }
+}
+
+// 空安全绑定：任何 id 缺失都只记一条告警，绝不能让整段脚本中止。
+// 之前正是因为某个按钮不存在，$(id).onclick 抛 TypeError，
+// 后面的 btn-save 绑定和 load() 全都再也没执行。
+function on(id, fn){
+  const el = $(id);
+  if (!el) { console.warn('[gc-ui] missing element: ' + id); return; }
+  el.onclick = fn;
+}
+
+// 未保存修改保护：一旦用户动过设置表单，轮询刷新就不再回写输入框，
+// 否则 15 秒一次的自动刷新会把用户还没保存的编辑悄悄覆盖掉。
+const FORM_IDS = ['f-allowAuthors','f-allowTopics','f-allowKeywords','f-allowEntryTypes','f-denyAuthors','f-denyTopics','f-denyKeywords','f-maxAgeHours','l-maxLikesPerRun','l-maxLikesPerDay','s-interval','t-delay','t-cooldown','f-onlyUnliked','n-enabled','n-onLike','n-onFailure','n-onSessionExpired','n-onRunSummary'];
+let formDirty = false;
+
+function setDirty(){
+  formDirty = true;
+  const hint = $('dirtyhint');
+  if (hint) hint.textContent = '有未保存的修改（自动刷新已暂停回写）';
+}
+function clearDirty(){
+  formDirty = false;
+  const hint = $('dirtyhint');
+  if (hint) hint.textContent = '';
+}
+FORM_IDS.forEach(id => {
+  const el = $(id);
+  if (!el) return;
+  const evt = (el.type === 'checkbox') ? 'change' : 'input';
+  el.addEventListener(evt, setDirty);
+});
+
+on('btn-dry', () => post('/api/job', { mode:'dry' }).then(r => { if (r.ok) toast('已开始试运行'); }));
+on('btn-run', () => post('/api/job', { mode:'run' }).then(r => { if (r.ok) toast('已开始点赞一轮'); }));
+on('btn-import', async () => { toast('正在导入，约需 10 秒…'); const r = await post('/api/session/import'); toast(r.message || '完成'); load(); });
+on('btn-notify', async () => { const r = await post('/api/notify/test'); toast(r.message || '完成'); });
+on('btn-task-install', () => { post('/api/task', { action:'install' }).then(r => { if (r.ok) toast('正在注册计划任务…'); }); });
+on('btn-task-start', () => { if (confirm('启用计划任务？启用后会自动按配置的间隔定期运行。')) post('/api/task', { action:'start' }).then(r => { if (r.ok) toast('正在启用…'); }); });
+on('btn-task-stop', () => { if (confirm('停止计划任务？停止后不再自动运行（任务保留，可随时重新启用）。')) post('/api/task', { action:'stop' }).then(r => { if (r.ok) toast('正在停止…'); }); });
+on('btn-task-remove', () => { if (confirm('确定删除计划任务？删除后不会再自动运行。')) post('/api/task', { action:'remove' }).then(() => toast('正在删除…')); });
+on('btn-save', save);
+on('btn-reset', () => { if (confirm('清空已处理记录？清空后已点赞过的动态会被重新扫描（通常会被跳过，因为已点赞）。')) post('/api/state/reset').then(r => { if (r.ok) toast('已清空'); load(); }); });
+
+load();
+setInterval(() => { if (!pollTimer) load(); }, 15000);
+</script>
+</body>
+</html>
