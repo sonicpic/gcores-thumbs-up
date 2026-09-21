@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         GCORES 动态自动点赞助手
 // @namespace    https://www.gcores.com/
-// @version      0.1.2
-// @description  机核动态页自动点赞助手，支持规则筛选、试运行、限速、请求捕获和 DOM 兜底。
+// @version      0.4.0
+// @description  机核动态与话题首页自动点赞助手，支持可视化配置、点赞历史、随机限速和刷新倒计时。
 // @match        https://www.gcores.com/feeds*
+// @match        https://www.gcores.com/topics/home*
 // @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -17,7 +18,8 @@
   'use strict';
 
   const SCRIPT_NAME = 'GCORES 动态自动点赞助手';
-  const SCRIPT_VERSION = '0.1.2';
+  const SCRIPT_VERSION = '0.4.0';
+  const CONFIG_REVISION = 2;
   const LEGACY_LIMIT_DEFAULTS = {
     maxLikesPerRun: 10,
     maxLikesPerDay: 30,
@@ -33,16 +35,7 @@
     'timelines',
   ];
   const PROCESSED_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
-  const AUTO_HEADER_NAME = 'x-gcores-auto-like';
-  const BUTTON_TEXT = {
-    start: '开始',
-    pause: '暂停',
-    stop: '停止',
-    dryRun: '试运行',
-    edit: '编辑配置',
-    export: '导出状态',
-    clear: '清空缓存',
-  };
+  const LIKE_HISTORY_MAX_ITEMS = 500;
   const STATUS_TEXT = {
     idle: '空闲',
     running: '运行中',
@@ -51,7 +44,7 @@
     stopped: '已停止',
     cooldown: '冷却中',
     login_required: '需要登录',
-    not_feeds: '不在动态页',
+    not_supported: '不在支持页面',
   };
   const SOURCE_MODE_TEXT = {
     api: '接口',
@@ -59,16 +52,6 @@
     dom: '页面按钮',
     none: '未校准',
   };
-  const FILTER_LABELS = {
-    allowAuthors: '允许作者',
-    allowTopics: '允许话题',
-    allowKeywords: '允许关键词',
-    allowEntryTypes: '允许内容类型',
-    denyAuthors: '屏蔽作者',
-    denyTopics: '屏蔽话题',
-    denyKeywords: '屏蔽关键词',
-  };
-
   const KNOWN_ENTRY_TYPES = [
     'articles',
     'videos',
@@ -85,6 +68,24 @@
     'films',
     'external-links',
   ];
+  const ENTRY_TYPE_LABELS = {
+    articles: '文章',
+    videos: '视频',
+    radios: '电台',
+    talks: '动态',
+    discussions: '讨论',
+    originals: '原创',
+    timelines: '时间线',
+    portfolios: '作品集',
+    albums: '专辑',
+    collections: '合集',
+    products: '商品',
+    games: '游戏',
+    films: '电影',
+    'external-links': '外部链接',
+    dom: '页面内容',
+    unknown: '未知类型',
+  };
 
   const STORAGE_KEYS = {
     config: 'gcores-auto-like:config',
@@ -96,20 +97,25 @@
   };
 
   const DEFAULT_CONFIG = {
+    configRevision: CONFIG_REVISION,
     autoStart: false,
-    dryRun: true,
+    dryRun: false,
     debug: false,
     limits: {
       maxLikesPerRun: 0,
       maxLikesPerDay: 0,
-      maxPagesPerRun: 5,
       maxConsecutiveErrors: 3,
     },
     timing: {
       actionDelayMsRange: [2500, 7000],
-      pageDelayMsRange: [4000, 9000],
       cooldownAfterBlockMs: 60 * 60 * 1000,
-      refreshIntervalMs: 5 * 60 * 1000,
+      refreshIntervalMsRange: [40 * 60 * 1000, 70 * 60 * 1000],
+      nightRefreshIntervalMsRange: [80 * 60 * 1000, 120 * 60 * 1000],
+      quietHours: {
+        enabled: true,
+        startHour: 1,
+        endHour: 8,
+      },
     },
     filters: {
       allowAuthors: [],
@@ -125,6 +131,9 @@
     cooldown: {
       blockedUntil: 0,
     },
+    safety: {
+      allowApiFallback: false,
+    },
   };
 
   const DEFAULT_PERSISTED = {
@@ -133,6 +142,7 @@
       date: '',
       likes: 0,
     },
+    likeHistory: [],
     lastError: null,
     lastDryRun: null,
     calibration: {
@@ -249,6 +259,15 @@
     return [Math.min(minValue, maxValue), Math.max(minValue, maxValue)];
   }
 
+  function equalRanges(left, right) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      Number(left[0]) === Number(right[0]) &&
+      Number(left[1]) === Number(right[1])
+    );
+  }
+
   function localDateKey(timestamp) {
     const date = new Date(timestamp);
     const year = String(date.getFullYear());
@@ -293,14 +312,47 @@
     return next;
   }
 
+  function sanitizeLikeHistory(history) {
+    if (!Array.isArray(history)) {
+      return [];
+    }
+    return history
+      .map((entry) => {
+        if (!isObject(entry)) {
+          return null;
+        }
+        const likedAt = clampNumber(entry.likedAt || entry.at, 0, 0);
+        const key = cleanText(entry.key || entry.itemKey);
+        if (!likedAt || !key) {
+          return null;
+        }
+        return {
+          key,
+          likedAt,
+          title: cleanText(entry.title || '未命名内容'),
+          url: cleanText(entry.url),
+          targetType: normalizeToken(entry.targetType || 'unknown'),
+          authors: uniqueStrings(Array.isArray(entry.authors) ? entry.authors : []),
+          topics: uniqueStrings(Array.isArray(entry.topics) ? entry.topics : []),
+          mode: cleanText(entry.mode || 'dom'),
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.likedAt - left.likedAt)
+      .slice(0, LIKE_HISTORY_MAX_ITEMS);
+  }
+
   function sanitizeConfig(config) {
+    const inputTiming = isObject(config?.timing) ? config.timing : {};
+    const inputConfigRevision = clampNumber(config?.configRevision, 0, 0);
     const merged = deepMerge(DEFAULT_CONFIG, isObject(config) ? config : {});
+    merged.configRevision = inputConfigRevision;
     merged.autoStart = Boolean(merged.autoStart);
     merged.dryRun = Boolean(merged.dryRun);
     merged.debug = Boolean(merged.debug);
     merged.limits.maxLikesPerRun = clampNumber(merged.limits.maxLikesPerRun, DEFAULT_CONFIG.limits.maxLikesPerRun, 0);
     merged.limits.maxLikesPerDay = clampNumber(merged.limits.maxLikesPerDay, DEFAULT_CONFIG.limits.maxLikesPerDay, 0);
-    merged.limits.maxPagesPerRun = clampNumber(merged.limits.maxPagesPerRun, DEFAULT_CONFIG.limits.maxPagesPerRun, 1);
+    delete merged.limits.maxPagesPerRun;
     merged.limits.maxConsecutiveErrors = clampNumber(
       merged.limits.maxConsecutiveErrors,
       DEFAULT_CONFIG.limits.maxConsecutiveErrors,
@@ -310,20 +362,39 @@
       merged.timing.actionDelayMsRange,
       DEFAULT_CONFIG.timing.actionDelayMsRange
     );
-    merged.timing.pageDelayMsRange = sanitizeRange(
-      merged.timing.pageDelayMsRange,
-      DEFAULT_CONFIG.timing.pageDelayMsRange
-    );
+    delete merged.timing.pageDelayMsRange;
     merged.timing.cooldownAfterBlockMs = clampNumber(
       merged.timing.cooldownAfterBlockMs,
       DEFAULT_CONFIG.timing.cooldownAfterBlockMs,
       1000
     );
-    merged.timing.refreshIntervalMs = clampNumber(
-      merged.timing.refreshIntervalMs,
-      DEFAULT_CONFIG.timing.refreshIntervalMs,
-      60 * 1000
+    const legacyRefreshIntervalMs = clampNumber(inputTiming.refreshIntervalMs, 0, 0);
+    const refreshRangeInput = Array.isArray(inputTiming.refreshIntervalMsRange)
+      ? inputTiming.refreshIntervalMsRange
+      : legacyRefreshIntervalMs > 0
+        ? [Math.round(legacyRefreshIntervalMs * 0.8), Math.round(legacyRefreshIntervalMs * 1.2)]
+        : DEFAULT_CONFIG.timing.refreshIntervalMsRange;
+    merged.timing.refreshIntervalMsRange = sanitizeRange(
+      refreshRangeInput,
+      DEFAULT_CONFIG.timing.refreshIntervalMsRange
+    ).map((value) => Math.max(60 * 1000, value));
+    merged.timing.nightRefreshIntervalMsRange = sanitizeRange(
+      inputTiming.nightRefreshIntervalMsRange,
+      DEFAULT_CONFIG.timing.nightRefreshIntervalMsRange
+    ).map((value) => Math.max(60 * 1000, value));
+    merged.timing.quietHours = isObject(merged.timing.quietHours)
+      ? merged.timing.quietHours
+      : deepClone(DEFAULT_CONFIG.timing.quietHours);
+    merged.timing.quietHours.enabled = Boolean(merged.timing.quietHours.enabled);
+    merged.timing.quietHours.startHour = Math.min(
+      23,
+      Math.floor(clampNumber(merged.timing.quietHours.startHour, DEFAULT_CONFIG.timing.quietHours.startHour, 0))
     );
+    merged.timing.quietHours.endHour = Math.min(
+      23,
+      Math.floor(clampNumber(merged.timing.quietHours.endHour, DEFAULT_CONFIG.timing.quietHours.endHour, 0))
+    );
+    delete merged.timing.refreshIntervalMs;
     merged.filters.allowAuthors = normalizeStringList(merged.filters.allowAuthors);
     merged.filters.allowTopics = normalizeStringList(merged.filters.allowTopics);
     merged.filters.allowKeywords = normalizeStringList(merged.filters.allowKeywords);
@@ -334,12 +405,32 @@
     merged.filters.maxAgeHours = clampNumber(merged.filters.maxAgeHours, DEFAULT_CONFIG.filters.maxAgeHours, 0);
     merged.filters.onlyUnliked = Boolean(merged.filters.onlyUnliked);
     merged.cooldown.blockedUntil = clampNumber(merged.cooldown.blockedUntil, 0, 0);
+    merged.safety = isObject(merged.safety) ? merged.safety : deepClone(DEFAULT_CONFIG.safety);
+    merged.safety.allowApiFallback = Boolean(merged.safety.allowApiFallback);
     return merged;
   }
 
   function migrateConfigForCurrentPageMode(config) {
     const next = sanitizeConfig(config);
     let changed = false;
+    let defaultsChanged = false;
+
+    if (next.configRevision < CONFIG_REVISION) {
+      const oldRefreshRanges = [
+        [4 * 60 * 1000, 8 * 60 * 1000],
+        [4 * 60 * 1000, 6 * 60 * 1000],
+      ];
+      if (oldRefreshRanges.some((range) => equalRanges(next.timing.refreshIntervalMsRange, range))) {
+        next.timing.refreshIntervalMsRange = DEFAULT_CONFIG.timing.refreshIntervalMsRange.slice();
+      }
+      if (equalRanges(next.timing.nightRefreshIntervalMsRange, [20 * 60 * 1000, 40 * 60 * 1000])) {
+        next.timing.nightRefreshIntervalMsRange = DEFAULT_CONFIG.timing.nightRefreshIntervalMsRange.slice();
+      }
+      next.dryRun = false;
+      next.configRevision = CONFIG_REVISION;
+      changed = true;
+      defaultsChanged = true;
+    }
 
     if (next.limits.maxLikesPerRun === LEGACY_LIMIT_DEFAULTS.maxLikesPerRun) {
       next.limits.maxLikesPerRun = 0;
@@ -361,6 +452,7 @@
     return {
       config: next,
       changed,
+      defaultsChanged,
     };
   }
 
@@ -368,6 +460,7 @@
     const merged = deepMerge(DEFAULT_PERSISTED, isObject(persisted) ? persisted : {});
     merged.processed = trimProcessedCache(merged.processed);
     merged.dailyCounter = resetDailyCounter(merged.dailyCounter);
+    merged.likeHistory = sanitizeLikeHistory(merged.likeHistory);
     merged.lastError = merged.lastError && typeof merged.lastError.message === 'string' ? merged.lastError : null;
     merged.lastDryRun = merged.lastDryRun && typeof merged.lastDryRun === 'object' ? merged.lastDryRun : null;
     merged.calibration = deepMerge(DEFAULT_PERSISTED.calibration, isObject(merged.calibration) ? merged.calibration : {});
@@ -448,6 +541,57 @@
       return minValue;
     }
     return Math.floor(minValue + Math.random() * (maxValue - minValue + 1));
+  }
+
+  function isHourInWindow(hour, startHour, endHour) {
+    if (startHour === endHour) {
+      return false;
+    }
+    if (startHour < endHour) {
+      return hour >= startHour && hour < endHour;
+    }
+    return hour >= startHour || hour < endHour;
+  }
+
+  function buildRefreshSchedule(now = Date.now()) {
+    const quietHours = runtime.config.timing.quietHours;
+    const hour = new Date(now).getHours();
+    const isNight =
+      quietHours.enabled && isHourInWindow(hour, quietHours.startHour, quietHours.endHour);
+    const range = isNight
+      ? runtime.config.timing.nightRefreshIntervalMsRange
+      : runtime.config.timing.refreshIntervalMsRange;
+    const delayMs = randomBetween(...range);
+    return {
+      delayMs,
+      range: range.slice(),
+      mode: isNight ? 'night' : 'normal',
+    };
+  }
+
+  function formatCountdown(milliseconds) {
+    const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) {
+      return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  function formatMinuteRange(range) {
+    const values = sanitizeRange(range, [0, 0]).map((value) => Math.round(value / 60000));
+    return values[0] === values[1] ? `${values[0]} 分钟` : `${values[0]}–${values[1]} 分钟`;
+  }
+
+  function formatDelayRange(range) {
+    const values = sanitizeRange(range, [0, 0]);
+    if (values[1] < 60 * 1000) {
+      const seconds = values.map((value) => Math.round(value / 100) / 10);
+      return seconds[0] === seconds[1] ? `${seconds[0]} 秒` : `${seconds[0]}–${seconds[1]} 秒`;
+    }
+    return formatMinuteRange(values);
   }
 
   function sleep(ms) {
@@ -562,8 +706,8 @@
     return type && id ? `${location.origin}/${type}/${id}` : '';
   }
 
-  function isFeedsPage() {
-    return /^\/feeds(?:\/|$)/.test(location.pathname);
+  function isSupportedPage() {
+    return /^\/feeds(?:\/|$)/.test(location.pathname) || /^\/topics\/home(?:\/|$)/.test(location.pathname);
   }
 
   function uniqueStrings(values) {
@@ -877,13 +1021,14 @@
         return;
       }
       seen.add(itemKey);
+      const authorLinks = Array.from(container?.querySelectorAll('a[href*="/users/"]') || []);
       const authorIds = uniqueStrings(
-        Array.from(container?.querySelectorAll('a[href*="/users/"]') || [])
-          .map((link) => link.getAttribute('href').match(/\/users\/(\d+)/)?.[1])
-          .filter(Boolean)
+        authorLinks.map((link) => link.getAttribute('href').match(/\/users\/(\d+)/)?.[1]).filter(Boolean)
       );
+      const authors = uniqueStrings(authorLinks.map((link) => cleanText(link.textContent || '')).filter(Boolean));
+      const topicLinks = Array.from(container?.querySelectorAll('a[href*="/topics/"]') || []);
       const topicIds = uniqueStrings(
-        Array.from(container?.querySelectorAll('a[href*="/topics/"]') || []).flatMap((link) => {
+        topicLinks.flatMap((link) => {
           const href = link.getAttribute('href') || '';
           const match = href.match(/\/topics\/([^/?#]+)/);
           const values = [];
@@ -897,6 +1042,16 @@
           return values;
         })
       );
+      const topics = uniqueStrings(
+        topicLinks.flatMap((link) => {
+          const text = cleanText(link.textContent || '');
+          if (text) {
+            return [text];
+          }
+          const match = (link.getAttribute('href') || '').match(/\/topics\/([^/?#]+)/);
+          return match ? [match[1]] : [];
+        })
+      );
       const likeButton = findLikeButton(container);
       if (likeButton) {
         runtime.domButtons.set(itemKey, likeButton);
@@ -908,7 +1063,9 @@
         voteId: null,
         alreadyLiked: isLikeButtonActive(likeButton),
         authorIds,
+        authors,
         topicIds,
+        topics,
         title: title || `${identity.targetType}/${identity.targetId}`,
         summary,
         url: parsed?.url || entryLink?.href || location.href,
@@ -1036,12 +1193,14 @@
     };
   }
 
-  function markProcessed(itemKey, status) {
+  function markProcessed(itemKey, status, shouldSave = true) {
     runtime.persisted.processed[itemKey] = {
       ts: Date.now(),
       status: cleanText(status || 'processed'),
     };
-    savePersisted();
+    if (shouldSave) {
+      savePersisted();
+    }
   }
 
   function wasProcessed(itemKey) {
@@ -1054,9 +1213,38 @@
     savePersisted();
   }
 
-  function incrementDailyLikes() {
+  function incrementDailyLikes(shouldSave = true) {
     runtime.persisted.dailyCounter = resetDailyCounter(runtime.persisted.dailyCounter);
     runtime.persisted.dailyCounter.likes += 1;
+    if (shouldSave) {
+      savePersisted();
+    }
+  }
+
+  function recordLikeHistory(item, mode, shouldSave = true) {
+    const key = buildItemKey(item);
+    const record = {
+      key,
+      likedAt: Date.now(),
+      title: cleanText(item.title || `${item.targetType || 'content'}/${item.targetId || key}`),
+      url: cleanText(item.url || buildEntryUrl(item.targetType, item.targetId)),
+      targetType: normalizeToken(item.targetType || 'unknown'),
+      authors: uniqueStrings(item.authors?.length ? item.authors : item.authorIds || []),
+      topics: uniqueStrings(item.topics?.length ? item.topics : item.topicIds || []),
+      mode: cleanText(mode || 'dom'),
+    };
+    const history = sanitizeLikeHistory(runtime.persisted.likeHistory);
+    runtime.persisted.likeHistory = [record, ...history.filter((entry) => entry.key !== key)].slice(
+      0,
+      LIKE_HISTORY_MAX_ITEMS
+    );
+    if (shouldSave) {
+      savePersisted();
+    }
+  }
+
+  function clearLikeHistory() {
+    runtime.persisted.likeHistory = [];
     savePersisted();
   }
 
@@ -1625,7 +1813,9 @@
         voteId: voteMeta.voteId,
         alreadyLiked: voteMeta.alreadyLiked,
         authorIds,
+        authors: authorIds,
         topicIds,
+        topics: topicIds,
         title: title || `${targetRecord.type}/${targetRecord.id}`,
         summary,
         url,
@@ -1708,7 +1898,6 @@
     const headers = {
       accept: 'application/json, application/vnd.api+json, text/plain, */*',
       ...options.headers,
-      [AUTO_HEADER_NAME]: SCRIPT_VERSION,
     };
     if (runtime.requestContext.csrfToken && !headers['x-csrf-token']) {
       headers['x-csrf-token'] = runtime.requestContext.csrfToken;
@@ -2014,10 +2203,16 @@
   }
 
   async function createVote(item) {
+    let domError = null;
     try {
       return await clickDomLikeButton(item);
     } catch (error) {
+      domError = error;
       logDebug('DOM vote click failed, falling back to request mode', error);
+    }
+
+    if (!runtime.config.safety.allowApiFallback) {
+      throw domError || new Error('页面点赞按钮点击失败');
     }
 
     const template = runtime.persisted.calibration.voteTemplates.post;
@@ -2036,6 +2231,9 @@
           voteId: extractVoteIdFromValue(result.payload),
         };
       } catch (error) {
+        if (error instanceof BlockedRequestError) {
+          throw error;
+        }
         logDebug('Template vote request failed, falling back', error);
       }
     }
@@ -2152,29 +2350,6 @@
     };
   }
 
-  async function scrollForMore(pageIndex, runner) {
-    const beforeCount = extractDomFeedItems().length;
-    const beforeHeight = document.documentElement.scrollHeight;
-    window.scrollTo({
-      top: document.documentElement.scrollHeight,
-      behavior: 'smooth',
-    });
-    const waited = await waitWithControl(randomBetween(...runtime.config.timing.pageDelayMsRange), runner);
-    if (!waited) {
-      return false;
-    }
-    await waitFor(
-      () => {
-        const afterCount = extractDomFeedItems().length;
-        const afterHeight = document.documentElement.scrollHeight;
-        return afterCount > beforeCount || afterHeight > beforeHeight || pageIndex === 0;
-      },
-      5000,
-      200
-    );
-    return true;
-  }
-
   class Runner {
     constructor() {
       this.status = 'idle';
@@ -2182,6 +2357,9 @@
       this.shouldStop = false;
       this.refreshTimerId = null;
       this.nextRefreshAt = 0;
+      this.refreshScheduleMode = 'normal';
+      this.refreshDelayMs = 0;
+      this.pausedFromStatus = null;
       this.sessionSeen = new Set();
       this.matchedPreview = [];
       this.stats = {
@@ -2194,12 +2372,17 @@
       };
     }
 
-    clearRefreshTimer() {
+    clearRefreshTimerHandle() {
       if (this.refreshTimerId) {
         window.clearTimeout(this.refreshTimerId);
         this.refreshTimerId = null;
       }
+    }
+
+    clearRefreshTimer() {
+      this.clearRefreshTimerHandle();
       this.nextRefreshAt = 0;
+      this.refreshDelayMs = 0;
       setScheduledRefreshAt(0);
     }
 
@@ -2220,25 +2403,86 @@
       return isPositiveLimit(runtime.config.limits.maxLikesPerRun) && this.stats.liked >= runtime.config.limits.maxLikesPerRun;
     }
 
+    canAutoRefresh() {
+      return (
+        !this.shouldStop &&
+        this.status !== 'paused' &&
+        isLoopEnabled() &&
+        !this.hasReachedDailyLimit() &&
+        !isCooldownActive() &&
+        isSupportedPage()
+      );
+    }
+
+    armRefreshTimer() {
+      this.clearRefreshTimerHandle();
+      if (!this.canAutoRefresh() || !this.nextRefreshAt) {
+        return;
+      }
+      const remainingMs = Math.max(0, this.nextRefreshAt - Date.now());
+      this.refreshTimerId = window.setTimeout(() => {
+        this.refreshTimerId = null;
+        this.refreshIfDue('timer');
+      }, remainingMs);
+    }
+
+    refreshIfDue(trigger) {
+      if (!this.canAutoRefresh()) {
+        return false;
+      }
+      const scheduledAt = this.nextRefreshAt || getScheduledRefreshAt();
+      if (!scheduledAt) {
+        return false;
+      }
+      this.nextRefreshAt = scheduledAt;
+      const remainingMs = scheduledAt - Date.now();
+      if (remainingMs > 250) {
+        this.armRefreshTimer();
+        updateUi();
+        return false;
+      }
+      logDebug(`Refresh deadline reached via ${trigger || 'unknown'}`);
+      this.clearRefreshTimerHandle();
+      setScheduledRefreshAt(0);
+      window.location.reload();
+      return true;
+    }
+
+    recoverRefreshSchedule(trigger) {
+      if (this.status !== 'waiting_refresh' || !isLoopEnabled()) {
+        updateUi();
+        return false;
+      }
+      const scheduledAt = this.nextRefreshAt || getScheduledRefreshAt();
+      if (!scheduledAt) {
+        this.scheduleRefresh();
+        return false;
+      }
+      this.nextRefreshAt = scheduledAt;
+      if (Date.now() >= scheduledAt) {
+        return this.refreshIfDue(trigger || 'lifecycle');
+      }
+      this.armRefreshTimer();
+      updateUi();
+      return false;
+    }
+
     scheduleRefresh() {
       this.clearRefreshTimer();
       if (this.shouldStop || this.status === 'paused' || !isLoopEnabled()) {
         return;
       }
-      if (this.hasReachedDailyLimit() || isCooldownActive() || !isFeedsPage()) {
+      if (this.hasReachedDailyLimit() || isCooldownActive() || !isSupportedPage()) {
         return;
       }
-      const delay = runtime.config.timing.refreshIntervalMs;
-      this.nextRefreshAt = Date.now() + delay;
+      const schedule = buildRefreshSchedule();
+      this.refreshScheduleMode = schedule.mode;
+      this.refreshDelayMs = schedule.delayMs;
+      this.nextRefreshAt = Date.now() + schedule.delayMs;
       setScheduledRefreshAt(this.nextRefreshAt);
       this.status = 'waiting_refresh';
       updateUi();
-      this.refreshTimerId = window.setTimeout(() => {
-        if (this.shouldStop || this.status === 'paused' || !isLoopEnabled()) {
-          return;
-        }
-        window.location.reload();
-      }, delay);
+      this.armRefreshTimer();
     }
 
     async start() {
@@ -2261,10 +2505,10 @@
         return;
       }
 
-      if (!isFeedsPage()) {
-        this.status = 'not_feeds';
+      if (!isSupportedPage()) {
+        this.status = 'not_supported';
         this.disableLoop();
-        setLastError('请先打开机核动态页 /feeds 再运行脚本。');
+        setLastError('请先打开机核动态页 /feeds 或话题首页 /topics/home 再运行脚本。');
         updateUi();
         return;
       }
@@ -2279,6 +2523,7 @@
       }
 
       this.shouldStop = false;
+      this.pausedFromStatus = null;
       this.status = 'running';
       this.sessionSeen.clear();
       this.matchedPreview = [];
@@ -2306,7 +2551,7 @@
         }
       } finally {
         this.persistDryRunSummary();
-        if (this.status === 'cooldown' || this.status === 'login_required' || this.status === 'not_feeds') {
+        if (this.status === 'cooldown' || this.status === 'login_required' || this.status === 'not_supported') {
           this.disableLoop();
         } else if (this.shouldStop) {
           this.status = 'stopped';
@@ -2326,6 +2571,7 @@
 
     pause() {
       if (this.status === 'running' || this.status === 'waiting_refresh') {
+        this.pausedFromStatus = this.status;
         setLoopEnabled(false);
         this.clearRefreshTimer();
         this.status = 'paused';
@@ -2335,14 +2581,22 @@
 
     resume() {
       if (this.status === 'paused') {
+        const previousStatus = this.pausedFromStatus;
+        this.pausedFromStatus = null;
         this.enableLoop();
+        if (previousStatus === 'waiting_refresh') {
+          this.status = 'waiting_refresh';
+          this.scheduleRefresh();
+          return;
+        }
         this.status = 'running';
-        this.scheduleRefresh();
+        updateUi();
       }
     }
 
     stop() {
       this.shouldStop = true;
+      this.pausedFromStatus = null;
       this.disableLoop();
       this.status = 'stopped';
       updateUi();
@@ -2362,14 +2616,14 @@
     }
 
     async runLoop() {
-      const ready = await waitFor(() => extractDomFeedItems().length > 0 || !isFeedsPage(), 10000, 250);
+      const ready = await waitFor(() => extractDomFeedItems().length > 0 || !isSupportedPage(), 10000, 250);
       if (this.shouldStop) {
         return;
       }
-      if (!isFeedsPage()) {
-        this.status = 'not_feeds';
+      if (!isSupportedPage()) {
+        this.status = 'not_supported';
         this.shouldStop = true;
-        setLastError('你已经离开动态页，脚本已自动停止。');
+        setLastError('你已经离开机核动态页或话题首页，脚本已自动停止。');
         updateUi();
         return;
       }
@@ -2443,9 +2697,10 @@
             item.alreadyLiked = true;
             this.stats.liked += 1;
             this.stats.consecutiveErrors = 0;
-            markProcessed(itemKey, result.mode || 'liked');
-            incrementDailyLikes();
-            updateUi();
+            markProcessed(itemKey, result.mode || 'liked', false);
+            incrementDailyLikes(false);
+            recordLikeHistory(item, result.mode || 'liked', false);
+            savePersisted();
             if (this.hasReachedDailyLimit() || this.hasReachedRunLimit()) {
               return;
             }
@@ -2474,6 +2729,7 @@
     constructor() {
       this.root = null;
       this.elements = {};
+      this.clockTimerId = null;
     }
 
     mount() {
@@ -2490,13 +2746,13 @@
       style.textContent = `
         .panel {
           position: fixed;
-          right: 20px;
-          bottom: 20px;
-          width: 320px;
+          right: 14px;
+          bottom: 14px;
+          width: min(360px, calc(100vw - 28px));
           z-index: 2147483647;
           font: 12px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          color: #1f2937;
-          background: rgba(255, 255, 255, 0.96);
+          color: #18212f;
+          background: rgba(255, 255, 255, 0.97);
           border: 1px solid rgba(15, 23, 42, 0.16);
           border-radius: 16px;
           box-shadow: 0 18px 50px rgba(15, 23, 42, 0.22);
@@ -2526,7 +2782,35 @@
           font-size: 10px;
           background: #e2e8f0;
         }
+        .status[data-status="running"] { color: #166534; background: #dcfce7; }
+        .status[data-status="waiting_refresh"] { color: #1d4ed8; background: #dbeafe; }
+        .status[data-status="paused"] { color: #92400e; background: #fef3c7; }
+        .status[data-status="cooldown"],
+        .status[data-status="login_required"] { color: #b91c1c; background: #fee2e2; }
         .body { padding: 12px 14px 14px; }
+        .countdown-card {
+          display: grid;
+          grid-template-columns: 1fr auto;
+          align-items: center;
+          gap: 4px 12px;
+          margin-bottom: 11px;
+          padding: 11px 12px;
+          border-radius: 13px;
+          color: #eff6ff;
+          background: linear-gradient(135deg, #172554, #1d4ed8 58%, #0891b2);
+          box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+        }
+        .countdown-label { font-size: 11px; color: rgba(239, 246, 255, 0.78); }
+        .countdown-value {
+          grid-row: 1 / span 2;
+          grid-column: 2;
+          min-width: 94px;
+          text-align: right;
+          font: 750 27px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          letter-spacing: -0.04em;
+          font-variant-numeric: tabular-nums;
+        }
+        .countdown-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .row {
           margin-bottom: 8px;
           color: #334155;
@@ -2548,6 +2832,7 @@
           color: #0f172a;
         }
         button:hover { background: #f8fafc; }
+        button:disabled { opacity: 0.42; cursor: not-allowed; }
         button.primary {
           background: #111827;
           color: #ffffff;
@@ -2557,6 +2842,11 @@
           background: #fff7ed;
           border-color: rgba(234, 88, 12, 0.25);
           color: #9a3412;
+        }
+        button.active {
+          color: #1d4ed8;
+          border-color: rgba(37, 99, 235, 0.35);
+          background: #eff6ff;
         }
         .rules {
           padding: 10px;
@@ -2568,48 +2858,693 @@
           overflow: auto;
           white-space: pre-wrap;
         }
+        @media (prefers-color-scheme: dark) {
+          .panel {
+            color: #e5e7eb;
+            background: rgba(15, 23, 42, 0.97);
+            border-color: rgba(148, 163, 184, 0.25);
+            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+          }
+          .header { background: linear-gradient(135deg, #111827, #172554); border-bottom-color: rgba(148, 163, 184, 0.18); }
+          .version, .row { color: #cbd5e1; }
+          button { color: #e5e7eb; background: #1e293b; border-color: rgba(148, 163, 184, 0.24); }
+          button:hover { background: #273449; }
+          button.primary { background: #f8fafc; color: #111827; border-color: #f8fafc; }
+          button.warn { background: #431407; color: #fdba74; border-color: rgba(251, 146, 60, 0.35); }
+          button.active { color: #93c5fd; background: #172554; border-color: rgba(96, 165, 250, 0.4); }
+          .rules { color: #cbd5e1; background: #111827; border-color: rgba(148, 163, 184, 0.16); }
+        }
+
+        :host, :host * { box-sizing: border-box; }
+        [hidden] { display: none !important; }
+        .panel {
+          right: 18px;
+          bottom: 18px;
+          width: min(390px, calc(100vw - 24px));
+          max-height: calc(100vh - 36px);
+          color: #172033;
+          background: rgba(250, 251, 255, 0.97);
+          border: 1px solid rgba(80, 94, 125, 0.18);
+          border-radius: 22px;
+          box-shadow: 0 24px 70px rgba(31, 41, 72, 0.24), 0 4px 16px rgba(31, 41, 72, 0.1);
+          font: 13px/1.45 Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          overflow: auto;
+          scrollbar-width: thin;
+        }
+        .header {
+          position: sticky;
+          top: 0;
+          z-index: 2;
+          padding: 14px 16px;
+          background: rgba(255, 255, 255, 0.9);
+          border-bottom: 1px solid rgba(80, 94, 125, 0.1);
+          backdrop-filter: blur(18px);
+        }
+        .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+        .brand-mark {
+          display: grid;
+          place-items: center;
+          width: 34px;
+          height: 34px;
+          flex: 0 0 auto;
+          color: #fff;
+          background: linear-gradient(145deg, #6d5dfc, #3b82f6);
+          border-radius: 11px;
+          box-shadow: 0 7px 18px rgba(79, 70, 229, 0.3);
+          font-size: 17px;
+          font-weight: 850;
+          letter-spacing: -0.04em;
+        }
+        .title { color: #111827; font-size: 14px; font-weight: 800; letter-spacing: -0.01em; }
+        .version { margin-top: 1px; color: #8992a6; font-size: 10px; font-weight: 650; letter-spacing: 0.05em; }
+        .status {
+          flex: 0 0 auto;
+          padding: 5px 9px;
+          color: #475569;
+          background: #eef1f7;
+          border: 1px solid rgba(71, 85, 105, 0.08);
+          font-size: 10px;
+          letter-spacing: 0;
+          text-transform: none;
+        }
+        .body { padding: 14px; }
+        .countdown-card {
+          position: relative;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          min-height: 88px;
+          margin-bottom: 12px;
+          padding: 16px;
+          overflow: hidden;
+          border-radius: 18px;
+          background:
+            radial-gradient(circle at 92% 0%, rgba(125, 211, 252, 0.42), transparent 35%),
+            linear-gradient(135deg, #312e81 0%, #4f46e5 47%, #0284c7 100%);
+          box-shadow: 0 14px 30px rgba(67, 56, 202, 0.22);
+        }
+        .countdown-card::after {
+          content: "";
+          position: absolute;
+          right: -22px;
+          bottom: -48px;
+          width: 128px;
+          height: 128px;
+          border: 1px solid rgba(255, 255, 255, 0.16);
+          border-radius: 50%;
+        }
+        .countdown-copy { position: relative; z-index: 1; min-width: 0; padding-right: 12px; }
+        .countdown-label { margin-bottom: 6px; color: rgba(255, 255, 255, 0.72); font-size: 11px; font-weight: 650; }
+        .countdown-meta { color: #fff; font-size: 12px; font-weight: 650; white-space: normal; }
+        .countdown-value {
+          position: relative;
+          z-index: 1;
+          grid-row: auto;
+          grid-column: auto;
+          min-width: 108px;
+          color: #fff;
+          font: 800 31px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          letter-spacing: -0.055em;
+          text-shadow: 0 2px 12px rgba(15, 23, 42, 0.2);
+        }
+        .controls { margin-bottom: 0; }
+        .main-controls { gap: 8px; margin-bottom: 12px; }
+        .main-controls button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          min-height: 40px;
+          border-radius: 12px;
+          font-weight: 720;
+        }
+        .button-icon { font-size: 10px; opacity: 0.76; }
+        button {
+          transition: transform 150ms ease, background 150ms ease, border-color 150ms ease, box-shadow 150ms ease;
+        }
+        button:hover:not(:disabled) { transform: translateY(-1px); }
+        button:active:not(:disabled) { transform: translateY(0); }
+        button.primary {
+          color: #fff;
+          background: linear-gradient(135deg, #4f46e5, #2563eb);
+          border-color: transparent;
+          box-shadow: 0 7px 16px rgba(79, 70, 229, 0.22);
+        }
+        button.warn { color: #b45309; background: #fffaf2; border-color: #fed7aa; }
+        .metrics {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 7px;
+          margin-bottom: 12px;
+        }
+        .metric {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 1px;
+          padding: 9px 4px 8px;
+          background: #fff;
+          border: 1px solid rgba(80, 94, 125, 0.1);
+          border-radius: 13px;
+        }
+        .metric.accent { background: #eef2ff; border-color: #d9ddff; }
+        .metric-value { color: #172033; font-size: 18px; font-weight: 820; font-variant-numeric: tabular-nums; }
+        .metric.accent .metric-value { color: #4f46e5; }
+        .metric-label { color: #8a94a8; font-size: 9px; white-space: nowrap; }
+        .strategy-card {
+          margin-bottom: 11px;
+          padding: 13px;
+          background: #fff;
+          border: 1px solid rgba(80, 94, 125, 0.11);
+          border-radius: 16px;
+        }
+        .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .section-title { color: #172033; font-size: 13px; font-weight: 780; }
+        .section-subtitle { margin-top: 1px; color: #9aa3b5; font-size: 10px; }
+        .mode-toggle {
+          flex: 0 0 auto;
+          padding: 5px 9px;
+          color: #4f46e5;
+          background: #eef2ff;
+          border-color: #d9ddff;
+          border-radius: 999px;
+          font-size: 10px;
+          font-weight: 750;
+        }
+        .mode-toggle.live { color: #047857; background: #ecfdf5; border-color: #a7f3d0; }
+        .strategy-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+        .strategy-tag {
+          display: inline-flex;
+          padding: 4px 7px;
+          color: #556176;
+          background: #f4f6fa;
+          border-radius: 7px;
+          font-size: 10px;
+          font-weight: 620;
+        }
+        .strategy-summary {
+          margin-top: 9px;
+          color: #667085;
+          font-size: 11px;
+          line-height: 1.65;
+          white-space: pre-wrap;
+        }
+        .error-card {
+          margin-bottom: 11px;
+          padding: 10px 11px;
+          color: #b42318;
+          background: #fff4f2;
+          border: 1px solid #fecdca;
+          border-radius: 12px;
+          font-size: 11px;
+        }
+        .settings-button {
+          display: grid;
+          grid-template-columns: auto 1fr auto;
+          align-items: center;
+          gap: 10px;
+          width: 100%;
+          padding: 11px 12px;
+          text-align: left;
+          background: #172033;
+          border-color: #172033;
+          border-radius: 14px;
+          color: #fff;
+        }
+        .settings-button:hover { background: #222d43; }
+        .settings-icon {
+          display: grid;
+          place-items: center;
+          width: 30px;
+          height: 30px;
+          color: #c7d2fe;
+          background: rgba(255, 255, 255, 0.1);
+          border-radius: 9px;
+          font-size: 15px;
+        }
+        .settings-button strong, .settings-button small { display: block; }
+        .settings-button strong { font-size: 12px; }
+        .settings-button small { margin-top: 1px; color: #aeb8ca; font-size: 9px; }
+        .settings-arrow { color: #8f9bb0; font-size: 22px; font-weight: 300; }
+        .history-button {
+          display: grid;
+          grid-template-columns: 1fr auto auto;
+          align-items: center;
+          gap: 9px;
+          width: 100%;
+          margin-top: 8px;
+          padding: 9px 12px;
+          color: #475467;
+          text-align: left;
+          background: #fff;
+          border-color: rgba(80, 94, 125, 0.12);
+          border-radius: 12px;
+        }
+        .history-button strong, .history-button small { display: block; }
+        .history-button strong { color: #344054; font-size: 11px; }
+        .history-button small { margin-top: 1px; color: #98a2b3; font-size: 9px; }
+        .history-count {
+          padding: 3px 7px;
+          color: #4f46e5;
+          background: #eef2ff;
+          border-radius: 999px;
+          font-size: 9px;
+          font-weight: 750;
+        }
+        .more-panel { margin-top: 9px; color: #7b8498; font-size: 10px; }
+        .more-panel summary { padding: 4px 2px; cursor: pointer; user-select: none; }
+        .diagnostics {
+          margin: 7px 0;
+          padding: 10px;
+          color: #697386;
+          background: #f2f4f8;
+          border-radius: 10px;
+          line-height: 1.65;
+          white-space: pre-wrap;
+        }
+        .secondary-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+        .secondary-controls button { padding: 7px; font-size: 10px; }
+
+        .settings-backdrop {
+          position: fixed;
+          inset: 0;
+          z-index: 2147483647;
+          display: grid;
+          place-items: center;
+          padding: 24px;
+          color: #172033;
+          background: rgba(12, 18, 32, 0.58);
+          backdrop-filter: blur(8px);
+          font: 13px/1.45 Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        .settings-modal {
+          display: flex;
+          flex-direction: column;
+          width: min(720px, 100%);
+          max-height: min(88vh, 850px);
+          overflow: hidden;
+          background: #f8f9fc;
+          border: 1px solid rgba(255, 255, 255, 0.42);
+          border-radius: 22px;
+          box-shadow: 0 30px 100px rgba(0, 0, 0, 0.34);
+        }
+        .settings-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 17px 20px;
+          background: #fff;
+          border-bottom: 1px solid #e8ebf2;
+        }
+        .settings-title { color: #111827; font-size: 17px; font-weight: 820; letter-spacing: -0.02em; }
+        .settings-subtitle { margin-top: 2px; color: #8a94a8; font-size: 11px; }
+        .icon-button {
+          display: grid;
+          place-items: center;
+          width: 34px;
+          height: 34px;
+          padding: 0;
+          color: #667085;
+          background: #f3f5f9;
+          border: 0;
+          border-radius: 10px;
+          font-size: 22px;
+          line-height: 1;
+        }
+        .settings-content {
+          padding: 16px;
+          overflow: auto;
+          scrollbar-width: thin;
+        }
+        .settings-section {
+          margin-bottom: 14px;
+          padding: 16px;
+          background: #fff;
+          border: 1px solid #e7eaf1;
+          border-radius: 16px;
+        }
+        .settings-section-title { color: #172033; font-size: 14px; font-weight: 800; }
+        .settings-section-desc { margin: 3px 0 13px; color: #8a94a8; font-size: 11px; }
+        .switch-list { border-top: 1px solid #eef0f4; }
+        .switch-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          min-height: 54px;
+          border-bottom: 1px solid #eef0f4;
+          cursor: pointer;
+        }
+        .switch-row.compact { min-height: 44px; border-bottom: 0; }
+        .switch-row span, .danger-option span { min-width: 0; }
+        .switch-row strong, .switch-row small, .danger-option strong, .danger-option small { display: block; }
+        .switch-row strong, .danger-option strong { color: #344054; font-size: 12px; }
+        .switch-row small, .danger-option small { margin-top: 2px; color: #98a2b3; font-size: 10px; }
+        input[type="checkbox"] {
+          width: 17px;
+          height: 17px;
+          flex: 0 0 auto;
+          accent-color: #4f46e5;
+        }
+        .switch-row > input[type="checkbox"] {
+          appearance: none;
+          position: relative;
+          width: 36px;
+          height: 21px;
+          background: #d7dce5;
+          border: 0;
+          border-radius: 999px;
+          outline: none;
+          cursor: pointer;
+          transition: background 160ms ease;
+        }
+        .switch-row > input[type="checkbox"]::after {
+          content: "";
+          position: absolute;
+          top: 3px;
+          left: 3px;
+          width: 15px;
+          height: 15px;
+          background: #fff;
+          border-radius: 50%;
+          box-shadow: 0 1px 4px rgba(15, 23, 42, 0.24);
+          transition: transform 160ms ease;
+        }
+        .switch-row > input[type="checkbox"]:checked { background: #5b51ed; }
+        .switch-row > input[type="checkbox"]:checked::after { transform: translateX(15px); }
+        .switch-row > input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18); }
+        .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+        .field-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .field {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          min-width: 0;
+          color: #475467;
+          font-size: 11px;
+          font-weight: 650;
+        }
+        .field.full { margin-top: 12px; }
+        .field > small { color: #98a2b3; font-size: 9px; font-weight: 500; }
+        input[type="number"], select, textarea {
+          width: 100%;
+          min-width: 0;
+          color: #344054;
+          background: #fafbfc;
+          border: 1px solid #dfe3eb;
+          border-radius: 9px;
+          outline: none;
+          font: inherit;
+          font-weight: 500;
+        }
+        input[type="number"], select { height: 36px; padding: 0 9px; }
+        textarea { padding: 9px 10px; resize: vertical; line-height: 1.5; }
+        input:focus, select:focus, textarea:focus { border-color: #818cf8; box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1); }
+        .range-inputs { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 7px; }
+        .range-inputs b { color: #98a2b3; font-size: 10px; font-weight: 600; }
+        .subsection {
+          margin-top: 14px;
+          padding: 5px 12px 13px;
+          background: #f8f9fc;
+          border: 1px solid #e9ecf2;
+          border-radius: 12px;
+        }
+        .choice-grid { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 4px; }
+        .choice-chip { cursor: pointer; }
+        .choice-chip input { position: absolute; opacity: 0; pointer-events: none; }
+        .choice-chip span {
+          display: inline-flex;
+          padding: 6px 9px;
+          color: #667085;
+          background: #f6f7fa;
+          border: 1px solid #e5e8ef;
+          border-radius: 8px;
+          font-size: 10px;
+          font-weight: 650;
+          transition: all 140ms ease;
+        }
+        .choice-chip input:checked + span { color: #4338ca; background: #eef2ff; border-color: #c7d2fe; }
+        .settings-details {
+          margin-top: 13px;
+          overflow: hidden;
+          background: #f9fafc;
+          border: 1px solid #e7eaf1;
+          border-radius: 12px;
+        }
+        .settings-details > summary {
+          padding: 11px 13px;
+          color: #475467;
+          cursor: pointer;
+          font-size: 11px;
+          font-weight: 720;
+        }
+        .settings-details.advanced { margin: 0 0 4px; background: #fff; }
+        .details-body { margin-top: 0; padding: 0 13px 13px; }
+        .details-body.field-grid { padding-top: 0; }
+        .checkbox-field { align-items: flex-start; }
+        .danger-option {
+          display: flex;
+          align-items: flex-start;
+          gap: 10px;
+          margin-top: 14px;
+          padding: 11px;
+          color: #b54708;
+          background: #fffaeb;
+          border: 1px solid #fedf89;
+          border-radius: 10px;
+          cursor: pointer;
+        }
+        .settings-footer {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 13px 18px;
+          background: #fff;
+          border-top: 1px solid #e8ebf2;
+        }
+        .settings-footer > div { display: flex; gap: 8px; }
+        .settings-footer button { min-width: 88px; padding: 9px 13px; }
+        .settings-footer .text-button { min-width: 0; padding-left: 0; color: #667085; background: transparent; border: 0; }
+        .history-modal { width: min(780px, 100%); }
+        .history-content {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          padding: 16px;
+          overflow: auto;
+          scrollbar-width: thin;
+        }
+        .history-card {
+          padding: 13px 14px;
+          background: #fff;
+          border: 1px solid #e7eaf1;
+          border-radius: 14px;
+        }
+        .history-card-header {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 14px;
+          padding-bottom: 10px;
+          border-bottom: 1px solid #eef0f4;
+        }
+        .history-item-title {
+          min-width: 0;
+          overflow: hidden;
+          color: #172033;
+          font-size: 12px;
+          font-weight: 760;
+          text-decoration: none;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        a.history-item-title:hover { color: #4f46e5; text-decoration: underline; }
+        .history-card-header time { flex: 0 0 auto; color: #98a2b3; font-size: 9px; }
+        .history-meta-grid {
+          display: grid;
+          grid-template-columns: 0.75fr 1fr 1.25fr;
+          gap: 10px;
+          padding-top: 10px;
+        }
+        .history-meta-field { min-width: 0; }
+        .history-meta-field span, .history-meta-field strong { display: block; }
+        .history-meta-field span { margin-bottom: 2px; color: #98a2b3; font-size: 9px; }
+        .history-meta-field strong {
+          overflow: hidden;
+          color: #475467;
+          font-size: 10px;
+          font-weight: 650;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .history-empty {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          min-height: 240px;
+          padding: 30px;
+          color: #98a2b3;
+          text-align: center;
+        }
+        .history-empty strong { margin-bottom: 5px; color: #475467; font-size: 14px; }
+        .history-empty span { font-size: 11px; }
+        .history-footer { color: #98a2b3; font-size: 9px; }
+        .history-footer button { color: #b42318; background: #fff4f2; border-color: #fecdca; }
+
+        @media (max-width: 640px) {
+          .panel { right: 8px; bottom: 8px; width: calc(100vw - 16px); max-height: calc(100vh - 16px); }
+          .settings-backdrop { padding: 8px; }
+          .settings-modal { max-height: calc(100vh - 16px); border-radius: 16px; }
+          .field-grid, .field-grid.three { grid-template-columns: 1fr; }
+          .settings-content { padding: 10px; }
+          .settings-section { padding: 13px; }
+          .history-meta-grid { grid-template-columns: 1fr; }
+          .history-card-header { flex-direction: column; gap: 4px; }
+        }
+
+        @media (prefers-color-scheme: dark) {
+          .panel { color: #e5e7eb; background: rgba(16, 22, 36, 0.97); border-color: rgba(148, 163, 184, 0.2); }
+          .header { background: rgba(17, 24, 39, 0.9); border-bottom-color: rgba(148, 163, 184, 0.12); }
+          .title, .section-title, .metric-value { color: #f8fafc; }
+          .metric, .strategy-card { background: #151d2c; border-color: rgba(148, 163, 184, 0.12); }
+          .metric.accent, .mode-toggle { background: #202756; border-color: #343c78; }
+          .metric-label, .section-subtitle, .strategy-summary { color: #98a4b8; }
+          .strategy-tag, .diagnostics { color: #aeb8c9; background: #202838; }
+          .settings-button { background: #293249; border-color: #293249; }
+          .history-button, .history-card { color: #d0d5dd; background: #151d2c; border-color: rgba(148, 163, 184, 0.12); }
+          .history-button strong, .history-item-title, .history-meta-field strong, .history-empty strong { color: #e2e8f0; }
+          .history-card-header { border-color: rgba(148, 163, 184, 0.12); }
+          .history-count { color: #c7d2fe; background: #292a63; }
+          .more-panel { color: #9aa5b8; }
+          .settings-modal { color: #e5e7eb; background: #111827; border-color: rgba(148, 163, 184, 0.18); }
+          .settings-header, .settings-footer, .settings-section, .settings-details.advanced {
+            background: #182132;
+            border-color: rgba(148, 163, 184, 0.13);
+          }
+          .settings-title, .settings-section-title, .switch-row strong, .danger-option strong { color: #f1f5f9; }
+          .settings-subtitle, .settings-section-desc, .switch-row small, .field > small { color: #8f9bb0; }
+          .switch-list, .switch-row { border-color: rgba(148, 163, 184, 0.12); }
+          .field { color: #c7d0df; }
+          input[type="number"], select, textarea { color: #e2e8f0; background: #111827; border-color: #344054; }
+          .subsection, .settings-details { background: #111827; border-color: #303b4f; }
+          .choice-chip span { color: #aeb8c9; background: #202838; border-color: #344054; }
+          .choice-chip input:checked + span { color: #c7d2fe; background: #292a63; border-color: #4f52a5; }
+          .danger-option { background: #3b2a12; border-color: #7a5521; }
+          .settings-footer button:not(.primary) { color: #d0d5dd; background: #202838; border-color: #344054; }
+        }
       `;
 
       const panel = document.createElement('div');
       panel.className = 'panel';
       panel.innerHTML = `
-        <div class="header">
-          <div>
-            <div class="title">${SCRIPT_NAME}</div>
-            <div class="version">v${SCRIPT_VERSION}</div>
+        <div class='header'>
+          <div class='brand'>
+            <div class='brand-mark'>G</div>
+            <div>
+              <div class='title'>动态点赞助手</div>
+              <div class='version'>GCORES · v${SCRIPT_VERSION}</div>
+            </div>
           </div>
-          <div class="status" id="status">空闲</div>
+          <div class='status' id='status'>空闲</div>
         </div>
-        <div class="body">
-          <div class="controls">
-            <button class="primary" data-action="start">${BUTTON_TEXT.start}</button>
-            <button data-action="pause">${BUTTON_TEXT.pause}</button>
-            <button class="warn" data-action="stop">${BUTTON_TEXT.stop}</button>
-            <button data-action="toggleDryRun">${BUTTON_TEXT.dryRun}</button>
-            <button data-action="edit">${BUTTON_TEXT.edit}</button>
-            <button data-action="export">${BUTTON_TEXT.export}</button>
+        <div class='body'>
+          <div class='countdown-card'>
+            <div class='countdown-copy'>
+              <div class='countdown-label' id='countdownLabel'>自动循环</div>
+              <div class='countdown-meta' id='countdownMeta'>尚未安排刷新</div>
+            </div>
+            <div class='countdown-value' id='countdown'>--:--</div>
           </div>
-          <div class="row" id="summary"></div>
-          <div class="row" id="calibration"></div>
-          <div class="row" id="error"></div>
-          <div class="row"><strong>筛选规则</strong></div>
-          <div class="rules" id="rules"></div>
-          <div class="controls" style="margin-top: 10px;">
-            <button data-action="clear">${BUTTON_TEXT.clear}</button>
+
+          <div class='controls main-controls'>
+            <button class='primary' data-action='start'><span class='button-icon'>▶</span><span>开始</span></button>
+            <button data-action='pause'><span class='button-icon'>Ⅱ</span><span>暂停</span></button>
+            <button class='warn' data-action='stop'><span class='button-icon'>■</span><span>停止</span></button>
           </div>
+
+          <div class='metrics'>
+            <div class='metric'><span class='metric-value' id='metricScanned'>0</span><span class='metric-label'>已扫描</span></div>
+            <div class='metric'><span class='metric-value' id='metricMatched'>0</span><span class='metric-label'>已命中</span></div>
+            <div class='metric accent'><span class='metric-value' id='metricLiked'>0</span><span class='metric-label'>本轮点赞</span></div>
+            <div class='metric'><span class='metric-value' id='metricDaily'>0</span><span class='metric-label'>今日累计</span></div>
+          </div>
+
+          <div class='strategy-card'>
+            <div class='section-heading'>
+              <div>
+                <div class='section-title'>当前策略</div>
+                <div class='section-subtitle'>只展示实际生效的规则</div>
+              </div>
+              <button class='mode-toggle' data-action='toggleDryRun' id='modeToggle'>安全预览</button>
+            </div>
+            <div class='strategy-tags' id='strategyTags'></div>
+            <div class='strategy-summary' id='strategySummary'></div>
+          </div>
+
+          <div class='error-card' id='error' hidden></div>
+
+          <button class='settings-button' data-action='edit'>
+            <span class='settings-icon'>⚙</span>
+            <span><strong>可视化配置</strong><small>刷新节奏、点赞上限和内容筛选</small></span>
+            <span class='settings-arrow'>›</span>
+          </button>
+
+          <button class='history-button' data-action='history'>
+            <span><strong>点赞历史</strong><small>查看类型、作者和话题</small></span>
+            <span class='history-count' id='historyCount'>0 条</span>
+            <span class='settings-arrow'>›</span>
+          </button>
+
+          <details class='more-panel'>
+            <summary>更多操作与运行信息</summary>
+            <div class='diagnostics' id='diagnostics'></div>
+            <div class='secondary-controls'>
+              <button data-action='export'>导出状态</button>
+              <button data-action='clear'>清空已处理缓存</button>
+            </div>
+          </details>
         </div>
       `;
 
+      const settingsBackdrop = document.createElement('div');
+      settingsBackdrop.className = 'settings-backdrop';
+      settingsBackdrop.hidden = true;
+      settingsBackdrop.innerHTML = this.buildSettingsMarkup();
+
+      const historyBackdrop = document.createElement('div');
+      historyBackdrop.className = 'settings-backdrop history-backdrop';
+      historyBackdrop.hidden = true;
+      historyBackdrop.innerHTML = this.buildHistoryMarkup();
+
       shadow.appendChild(style);
       shadow.appendChild(panel);
+      shadow.appendChild(settingsBackdrop);
+      shadow.appendChild(historyBackdrop);
 
+      this.elements.panel = panel;
+      this.elements.settingsBackdrop = settingsBackdrop;
+      this.elements.settingsForm = settingsBackdrop.querySelector('#settingsForm');
+      this.elements.historyBackdrop = historyBackdrop;
+      this.elements.historyList = historyBackdrop.querySelector('#historyList');
+      this.elements.historyCount = shadow.getElementById('historyCount');
       this.elements.status = shadow.getElementById('status');
-      this.elements.summary = shadow.getElementById('summary');
-      this.elements.calibration = shadow.getElementById('calibration');
+      this.elements.countdown = shadow.getElementById('countdown');
+      this.elements.countdownLabel = shadow.getElementById('countdownLabel');
+      this.elements.countdownMeta = shadow.getElementById('countdownMeta');
+      this.elements.metricScanned = shadow.getElementById('metricScanned');
+      this.elements.metricMatched = shadow.getElementById('metricMatched');
+      this.elements.metricLiked = shadow.getElementById('metricLiked');
+      this.elements.metricDaily = shadow.getElementById('metricDaily');
+      this.elements.strategyTags = shadow.getElementById('strategyTags');
+      this.elements.strategySummary = shadow.getElementById('strategySummary');
+      this.elements.diagnostics = shadow.getElementById('diagnostics');
       this.elements.error = shadow.getElementById('error');
-      this.elements.rules = shadow.getElementById('rules');
+      this.elements.buttons = {};
 
       shadow.querySelectorAll('button[data-action]').forEach((button) => {
+        this.elements.buttons[button.getAttribute('data-action')] = button;
         button.addEventListener('click', () => {
           const action = button.getAttribute('data-action');
           if (action === 'start') {
@@ -2629,18 +3564,580 @@
             runtime.config.dryRun = !runtime.config.dryRun;
             saveConfig(runtime.config);
           } else if (action === 'edit') {
-            editConfig();
+            this.openSettings();
+          } else if (action === 'history') {
+            this.openHistory();
           } else if (action === 'export') {
             exportState();
           } else if (action === 'clear') {
-            if (window.confirm('Clear processed cache?')) {
+            if (window.confirm('确定清空已处理缓存吗？清空后，当前页内容可能会再次进入处理队列。')) {
               clearProcessedCache();
+            }
+          } else if (action === 'settingsClose' || action === 'settingsCancel') {
+            this.closeSettings();
+          } else if (action === 'historyClose') {
+            this.closeHistory();
+          } else if (action === 'historyClear') {
+            if (window.confirm('确定清空点赞历史吗？该操作不会影响已处理缓存和今日计数。')) {
+              clearLikeHistory();
+              this.renderHistory();
+              notify('点赞历史已清空。');
+            }
+          } else if (action === 'settingsReset') {
+            if (window.confirm('确定恢复推荐配置吗？现有筛选规则和时间设置会被覆盖。')) {
+              const resetConfig = deepClone(DEFAULT_CONFIG);
+              resetConfig.cooldown.blockedUntil = runtime.config.cooldown.blockedUntil;
+              saveConfig(resetConfig);
+              if (runtime.runner?.status === 'waiting_refresh' && isLoopEnabled()) {
+                runtime.runner.scheduleRefresh();
+              }
+              this.fillSettingsForm(runtime.config);
+              notify('已恢复推荐配置。');
             }
           }
         });
       });
 
+      this.elements.settingsForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        this.saveSettingsForm();
+      });
+      settingsBackdrop.addEventListener('click', (event) => {
+        if (event.target === settingsBackdrop) {
+          this.closeSettings();
+        }
+      });
+      settingsBackdrop.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          this.closeSettings();
+        }
+      });
+      historyBackdrop.addEventListener('click', (event) => {
+        if (event.target === historyBackdrop) {
+          this.closeHistory();
+        }
+      });
+      historyBackdrop.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          this.closeHistory();
+        }
+      });
+
       this.update();
+      this.startClock();
+    }
+
+    buildHourOptions() {
+      return Array.from({ length: 24 }, (_, hour) => {
+        const label = `${String(hour).padStart(2, '0')}:00`;
+        return `<option value='${hour}'>${label}</option>`;
+      }).join('');
+    }
+
+    buildEntryTypeChoices() {
+      return KNOWN_ENTRY_TYPES.map((type) => {
+        const label = ENTRY_TYPE_LABELS[type] || type;
+        return `
+          <label class='choice-chip'>
+            <input type='checkbox' name='entryType' value='${type}'>
+            <span>${label}</span>
+          </label>
+        `;
+      }).join('');
+    }
+
+    buildHistoryMarkup() {
+      return `
+        <div class='settings-modal history-modal' role='dialog' aria-modal='true' aria-labelledby='historyTitle'>
+          <div class='settings-header'>
+            <div>
+              <div class='settings-title' id='historyTitle'>点赞历史</div>
+              <div class='settings-subtitle'>仅记录脚本真实点赞成功的内容，最多保留 ${LIKE_HISTORY_MAX_ITEMS} 条</div>
+            </div>
+            <button type='button' class='icon-button' data-action='historyClose' aria-label='关闭'>×</button>
+          </div>
+          <div class='history-content' id='historyList'></div>
+          <div class='settings-footer history-footer'>
+            <span>内容类型、作者和话题来自点赞时的页面信息</span>
+            <button type='button' data-action='historyClear'>清空历史</button>
+          </div>
+        </div>
+      `;
+    }
+
+    buildSettingsMarkup() {
+      const hourOptions = this.buildHourOptions();
+      return `
+        <form class='settings-modal' id='settingsForm'>
+          <div class='settings-header'>
+            <div>
+              <div class='settings-title'>自动点赞配置</div>
+              <div class='settings-subtitle'>常用选项直接调整，高级设置默认折叠</div>
+            </div>
+            <button type='button' class='icon-button' data-action='settingsClose' aria-label='关闭'>×</button>
+          </div>
+
+          <div class='settings-content'>
+            <section class='settings-section'>
+              <div class='settings-section-title'>运行方式</div>
+              <div class='settings-section-desc'>建议先使用安全预览确认筛选结果，再关闭预览进行真实点赞。</div>
+              <div class='switch-list'>
+                <label class='switch-row'>
+                  <span><strong>安全预览</strong><small>只统计命中内容，不执行点赞</small></span>
+                  <input type='checkbox' name='dryRun'>
+                </label>
+                <label class='switch-row'>
+                  <span><strong>打开支持页面后自动开始</strong><small>进入动态页或话题首页后自动运行一轮</small></span>
+                  <input type='checkbox' name='autoStart'>
+                </label>
+                <label class='switch-row'>
+                  <span><strong>只处理尚未点赞的内容</strong><small>避免误触导致取消点赞</small></span>
+                  <input type='checkbox' name='onlyUnliked'>
+                </label>
+              </div>
+              <div class='field-grid three'>
+                <label class='field'>
+                  <span>每轮最多点赞</span>
+                  <input type='number' name='maxLikesPerRun' min='0' step='1'>
+                  <small>0 表示不限</small>
+                </label>
+                <label class='field'>
+                  <span>每天最多点赞</span>
+                  <input type='number' name='maxLikesPerDay' min='0' step='1'>
+                  <small>0 表示不限</small>
+                </label>
+                <label class='field'>
+                  <span>内容最大时效</span>
+                  <input type='number' name='maxAgeHours' min='0' step='1'>
+                  <small>小时，0 表示不限</small>
+                </label>
+              </div>
+            </section>
+
+            <section class='settings-section'>
+              <div class='settings-section-title'>运行节奏</div>
+              <div class='settings-section-desc'>每一轮都会在区间内重新随机，倒计时显示本轮实际选中的时间。</div>
+              <div class='field-grid'>
+                <label class='field'>
+                  <span>两次点赞间隔（秒）</span>
+                  <div class='range-inputs'>
+                    <input type='number' name='actionDelayMinSec' min='0.5' step='0.5'>
+                    <b>至</b>
+                    <input type='number' name='actionDelayMaxSec' min='0.5' step='0.5'>
+                  </div>
+                </label>
+                <label class='field'>
+                  <span>日间刷新间隔（分钟）</span>
+                  <div class='range-inputs'>
+                    <input type='number' name='refreshMinMin' min='1' step='1'>
+                    <b>至</b>
+                    <input type='number' name='refreshMaxMin' min='1' step='1'>
+                  </div>
+                </label>
+              </div>
+
+              <div class='subsection'>
+                <label class='switch-row compact'>
+                  <span><strong>启用夜间低频模式</strong><small>在指定时段自动延长刷新间隔</small></span>
+                  <input type='checkbox' name='quietEnabled'>
+                </label>
+                <div class='field-grid three'>
+                  <label class='field'>
+                    <span>开始时间</span>
+                    <select name='quietStartHour'>${hourOptions}</select>
+                  </label>
+                  <label class='field'>
+                    <span>结束时间</span>
+                    <select name='quietEndHour'>${hourOptions}</select>
+                  </label>
+                  <label class='field'>
+                    <span>夜间刷新（分钟）</span>
+                    <div class='range-inputs'>
+                      <input type='number' name='nightRefreshMinMin' min='1' step='1'>
+                      <b>至</b>
+                      <input type='number' name='nightRefreshMaxMin' min='1' step='1'>
+                    </div>
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <section class='settings-section'>
+              <div class='settings-section-title'>内容筛选</div>
+              <div class='settings-section-desc'>所有“允许”项都为空时，默认处理当前页全部可见内容；屏蔽规则始终优先生效。</div>
+
+              <label class='field full'>
+                <span>允许的内容类型</span>
+                <small>不选择代表不限制类型</small>
+                <div class='choice-grid'>${this.buildEntryTypeChoices()}</div>
+              </label>
+
+              <div class='field-grid'>
+                <label class='field'>
+                  <span>只允许包含这些关键词</span>
+                  <textarea name='allowKeywords' rows='3' placeholder='例如：独立游戏, 电影&#10;留空表示不限制'></textarea>
+                  <small>逗号或换行分隔，满足任意一个即可</small>
+                </label>
+                <label class='field'>
+                  <span>屏蔽包含这些关键词</span>
+                  <textarea name='denyKeywords' rows='3' placeholder='例如：抽奖, 广告'></textarea>
+                  <small>屏蔽规则优先于允许规则</small>
+                </label>
+              </div>
+
+              <details class='settings-details'>
+                <summary>作者与话题筛选</summary>
+                <div class='details-body field-grid'>
+                  <label class='field'>
+                    <span>允许作者</span>
+                    <textarea name='allowAuthors' rows='2' placeholder='作者用户 ID，逗号或换行分隔'></textarea>
+                  </label>
+                  <label class='field'>
+                    <span>屏蔽作者</span>
+                    <textarea name='denyAuthors' rows='2' placeholder='作者用户 ID，逗号或换行分隔'></textarea>
+                  </label>
+                  <label class='field'>
+                    <span>允许话题</span>
+                    <textarea name='allowTopics' rows='2' placeholder='话题名称、slug 或 ID'></textarea>
+                  </label>
+                  <label class='field'>
+                    <span>屏蔽话题</span>
+                    <textarea name='denyTopics' rows='2' placeholder='话题名称、slug 或 ID'></textarea>
+                  </label>
+                </div>
+              </details>
+            </section>
+
+            <details class='settings-details advanced'>
+              <summary>高级与故障处理</summary>
+              <div class='details-body'>
+                <div class='field-grid three'>
+                  <label class='field'>
+                    <span>连续错误上限</span>
+                    <input type='number' name='maxConsecutiveErrors' min='1' step='1'>
+                  </label>
+                  <label class='field'>
+                    <span>风控冷却（分钟）</span>
+                    <input type='number' name='cooldownMinutes' min='1' step='1'>
+                  </label>
+                  <label class='field checkbox-field'>
+                    <span>调试日志</span>
+                    <input type='checkbox' name='debug'>
+                  </label>
+                </div>
+                <label class='danger-option'>
+                  <input type='checkbox' name='apiFallback'>
+                  <span><strong>启用 API 兜底</strong><small>页面按钮失效时尝试接口请求，可能增加异常请求，不建议日常开启。</small></span>
+                </label>
+              </div>
+            </details>
+          </div>
+
+          <div class='settings-footer'>
+            <button type='button' class='text-button' data-action='settingsReset'>恢复推荐值</button>
+            <div>
+              <button type='button' data-action='settingsCancel'>取消</button>
+              <button type='submit' class='primary'>保存配置</button>
+            </div>
+          </div>
+        </form>
+      `;
+    }
+
+    getFormField(name) {
+      return this.elements.settingsForm?.elements?.namedItem(name) || null;
+    }
+
+    setFormValue(name, value) {
+      const field = this.getFormField(name);
+      if (field) {
+        field.value = String(value ?? '');
+      }
+    }
+
+    setFormChecked(name, checked) {
+      const field = this.getFormField(name);
+      if (field) {
+        field.checked = Boolean(checked);
+      }
+    }
+
+    fillSettingsForm(config) {
+      const timing = config.timing;
+      const filters = config.filters;
+      this.setFormChecked('dryRun', config.dryRun);
+      this.setFormChecked('autoStart', config.autoStart);
+      this.setFormChecked('onlyUnliked', filters.onlyUnliked);
+      this.setFormValue('maxLikesPerRun', config.limits.maxLikesPerRun);
+      this.setFormValue('maxLikesPerDay', config.limits.maxLikesPerDay);
+      this.setFormValue('maxAgeHours', filters.maxAgeHours);
+      this.setFormValue('actionDelayMinSec', timing.actionDelayMsRange[0] / 1000);
+      this.setFormValue('actionDelayMaxSec', timing.actionDelayMsRange[1] / 1000);
+      this.setFormValue('refreshMinMin', timing.refreshIntervalMsRange[0] / 60000);
+      this.setFormValue('refreshMaxMin', timing.refreshIntervalMsRange[1] / 60000);
+      this.setFormChecked('quietEnabled', timing.quietHours.enabled);
+      this.setFormValue('quietStartHour', timing.quietHours.startHour);
+      this.setFormValue('quietEndHour', timing.quietHours.endHour);
+      this.setFormValue('nightRefreshMinMin', timing.nightRefreshIntervalMsRange[0] / 60000);
+      this.setFormValue('nightRefreshMaxMin', timing.nightRefreshIntervalMsRange[1] / 60000);
+      this.setFormValue('allowKeywords', filters.allowKeywords.join('\n'));
+      this.setFormValue('denyKeywords', filters.denyKeywords.join('\n'));
+      this.setFormValue('allowAuthors', filters.allowAuthors.join('\n'));
+      this.setFormValue('denyAuthors', filters.denyAuthors.join('\n'));
+      this.setFormValue('allowTopics', filters.allowTopics.join('\n'));
+      this.setFormValue('denyTopics', filters.denyTopics.join('\n'));
+      this.setFormValue('maxConsecutiveErrors', config.limits.maxConsecutiveErrors);
+      this.setFormValue('cooldownMinutes', Math.round(timing.cooldownAfterBlockMs / 60000));
+      this.setFormChecked('debug', config.debug);
+      this.setFormChecked('apiFallback', config.safety.allowApiFallback);
+      const selectedTypes = new Set(filters.allowEntryTypes);
+      this.elements.settingsForm.querySelectorAll('input[name="entryType"]').forEach((input) => {
+        input.checked = selectedTypes.has(input.value);
+      });
+    }
+
+    openSettings() {
+      this.fillSettingsForm(runtime.config);
+      this.elements.settingsBackdrop.hidden = false;
+      window.setTimeout(() => this.getFormField('dryRun')?.focus(), 0);
+    }
+
+    closeSettings() {
+      this.elements.settingsBackdrop.hidden = true;
+    }
+
+    openHistory() {
+      this.renderHistory();
+      this.elements.historyBackdrop.hidden = false;
+      window.setTimeout(
+        () => this.elements.historyBackdrop.querySelector('[data-action="historyClose"]')?.focus(),
+        0
+      );
+    }
+
+    closeHistory() {
+      this.elements.historyBackdrop.hidden = true;
+    }
+
+    renderHistory() {
+      const history = sanitizeLikeHistory(runtime.persisted.likeHistory);
+      runtime.persisted.likeHistory = history;
+      const list = this.elements.historyList;
+      if (!list) {
+        return;
+      }
+      if (history.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'history-empty';
+        const title = document.createElement('strong');
+        title.textContent = '还没有点赞记录';
+        const description = document.createElement('span');
+        description.textContent = '关闭安全预览并成功点赞后，记录会出现在这里。';
+        empty.append(title, description);
+        list.replaceChildren(empty);
+        return;
+      }
+
+      const createMeta = (label, value) => {
+        const field = document.createElement('div');
+        field.className = 'history-meta-field';
+        const name = document.createElement('span');
+        name.textContent = label;
+        const content = document.createElement('strong');
+        content.textContent = value;
+        field.append(name, content);
+        return field;
+      };
+
+      list.replaceChildren(
+        ...history.map((entry) => {
+          const card = document.createElement('article');
+          card.className = 'history-card';
+          const header = document.createElement('div');
+          header.className = 'history-card-header';
+          const title = entry.url ? document.createElement('a') : document.createElement('span');
+          title.className = 'history-item-title';
+          title.textContent = entry.title;
+          if (entry.url) {
+            title.href = entry.url;
+            title.target = '_blank';
+            title.rel = 'noopener noreferrer';
+          }
+          const time = document.createElement('time');
+          time.textContent = new Date(entry.likedAt).toLocaleString('zh-CN', { hour12: false });
+          header.append(title, time);
+          const meta = document.createElement('div');
+          meta.className = 'history-meta-grid';
+          meta.append(
+            createMeta('内容类型', ENTRY_TYPE_LABELS[entry.targetType] || entry.targetType || '未知'),
+            createMeta('作者', entry.authors.join('、') || '未知作者'),
+            createMeta('话题', entry.topics.join('、') || '未标记话题')
+          );
+          card.append(header, meta);
+          return card;
+        })
+      );
+    }
+
+    parseListField(name) {
+      const value = this.getFormField(name)?.value || '';
+      return value
+        .split(/[\n,，]+/)
+        .map((item) => cleanText(item))
+        .filter(Boolean);
+    }
+
+    readNumberField(name, fallback, minValue = 0) {
+      const value = Number(this.getFormField(name)?.value);
+      return Number.isFinite(value) ? Math.max(minValue, value) : fallback;
+    }
+
+    readRangeFields(minName, maxName, multiplier, fallback, minValue) {
+      const min = this.readNumberField(minName, fallback[0] / multiplier, minValue);
+      const max = this.readNumberField(maxName, fallback[1] / multiplier, minValue);
+      return sanitizeRange([min * multiplier, max * multiplier], fallback);
+    }
+
+    saveSettingsForm() {
+      const next = deepClone(runtime.config);
+      const timing = next.timing;
+      const filters = next.filters;
+      next.dryRun = Boolean(this.getFormField('dryRun')?.checked);
+      next.autoStart = Boolean(this.getFormField('autoStart')?.checked);
+      next.debug = Boolean(this.getFormField('debug')?.checked);
+      next.limits.maxLikesPerRun = this.readNumberField('maxLikesPerRun', next.limits.maxLikesPerRun, 0);
+      next.limits.maxLikesPerDay = this.readNumberField('maxLikesPerDay', next.limits.maxLikesPerDay, 0);
+      next.limits.maxConsecutiveErrors = this.readNumberField(
+        'maxConsecutiveErrors',
+        next.limits.maxConsecutiveErrors,
+        1
+      );
+      filters.maxAgeHours = this.readNumberField('maxAgeHours', filters.maxAgeHours, 0);
+      filters.onlyUnliked = Boolean(this.getFormField('onlyUnliked')?.checked);
+      timing.actionDelayMsRange = this.readRangeFields(
+        'actionDelayMinSec',
+        'actionDelayMaxSec',
+        1000,
+        timing.actionDelayMsRange,
+        0.5
+      );
+      timing.refreshIntervalMsRange = this.readRangeFields(
+        'refreshMinMin',
+        'refreshMaxMin',
+        60000,
+        timing.refreshIntervalMsRange,
+        1
+      );
+      timing.nightRefreshIntervalMsRange = this.readRangeFields(
+        'nightRefreshMinMin',
+        'nightRefreshMaxMin',
+        60000,
+        timing.nightRefreshIntervalMsRange,
+        1
+      );
+      timing.quietHours.enabled = Boolean(this.getFormField('quietEnabled')?.checked);
+      timing.quietHours.startHour = Math.min(23, Math.floor(this.readNumberField('quietStartHour', 1, 0)));
+      timing.quietHours.endHour = Math.min(23, Math.floor(this.readNumberField('quietEndHour', 8, 0)));
+      timing.cooldownAfterBlockMs =
+        this.readNumberField('cooldownMinutes', timing.cooldownAfterBlockMs / 60000, 1) * 60000;
+      filters.allowKeywords = this.parseListField('allowKeywords');
+      filters.denyKeywords = this.parseListField('denyKeywords');
+      filters.allowAuthors = this.parseListField('allowAuthors');
+      filters.denyAuthors = this.parseListField('denyAuthors');
+      filters.allowTopics = this.parseListField('allowTopics');
+      filters.denyTopics = this.parseListField('denyTopics');
+      filters.allowEntryTypes = Array.from(
+        this.elements.settingsForm.querySelectorAll('input[name="entryType"]:checked')
+      ).map((input) => input.value);
+      next.safety.allowApiFallback = Boolean(this.getFormField('apiFallback')?.checked);
+
+      saveConfig(next);
+      if (runtime.runner?.status === 'waiting_refresh' && isLoopEnabled()) {
+        runtime.runner.scheduleRefresh();
+      }
+      this.closeSettings();
+      notify('配置已保存并生效。');
+    }
+
+    startClock() {
+      const tick = () => {
+        if (!this.root) {
+          return;
+        }
+        this.updateClock();
+        this.clockTimerId = window.setTimeout(tick, document.hidden ? 15000 : 1000);
+      };
+      tick();
+    }
+
+    updateClock() {
+      if (!this.elements.countdown) {
+        return;
+      }
+      const runner = runtime.runner;
+      const status = runner?.status || 'idle';
+      const now = Date.now();
+      const blockedUntil = getBlockedUntil();
+      const nextRefreshAt = runner?.nextRefreshAt || getScheduledRefreshAt();
+      const pageState = document.hidden ? '浏览器后台，恢复后会校时' : '页面前台';
+
+      if (blockedUntil > now) {
+        this.elements.countdownLabel.textContent = '风控冷却剩余';
+        this.elements.countdown.textContent = formatCountdown(blockedUntil - now);
+        this.elements.countdownMeta.textContent = `结束于 ${new Date(blockedUntil).toLocaleTimeString()} · ${pageState}`;
+        return;
+      }
+      if (status === 'waiting_refresh' && nextRefreshAt > 0) {
+        const remainingMs = nextRefreshAt - now;
+        this.elements.countdownLabel.textContent = runner?.refreshScheduleMode === 'night' ? '夜间低频 · 下次刷新' : '下次随机刷新';
+        this.elements.countdown.textContent = remainingMs > 0 ? formatCountdown(remainingMs) : '00:00';
+        this.elements.countdownMeta.textContent = `预计 ${new Date(nextRefreshAt).toLocaleTimeString()} · ${pageState}`;
+        if (remainingMs <= 0) {
+          runner?.recoverRefreshSchedule('countdown');
+        }
+        return;
+      }
+      if (status === 'running') {
+        this.elements.countdownLabel.textContent = '正在处理当前页';
+        this.elements.countdown.textContent = '运行中';
+        this.elements.countdownMeta.textContent = `完成后安排下一次随机刷新 · ${pageState}`;
+        return;
+      }
+      if (status === 'paused') {
+        this.elements.countdownLabel.textContent = '自动循环已暂停';
+        this.elements.countdown.textContent = '暂停';
+        this.elements.countdownMeta.textContent = '点击“继续”后重新安排刷新';
+        return;
+      }
+      this.elements.countdownLabel.textContent = '自动循环';
+      this.elements.countdown.textContent = '--:--';
+      this.elements.countdownMeta.textContent = '点击“开始”运行并安排刷新';
+    }
+
+    renderStrategy() {
+      const tags = [];
+      const filters = runtime.config.filters;
+      const quietHours = runtime.config.timing.quietHours;
+      tags.push(runtime.config.dryRun ? '安全预览' : '真实点赞');
+      tags.push(`日间 ${formatMinuteRange(runtime.config.timing.refreshIntervalMsRange)}`);
+      if (quietHours.enabled) {
+        tags.push(`夜间 ${quietHours.startHour}:00–${quietHours.endHour}:00`);
+      }
+      if (filters.onlyUnliked) {
+        tags.push('仅未点赞');
+      }
+      if (isPositiveLimit(runtime.config.limits.maxLikesPerDay)) {
+        tags.push(`每日上限 ${runtime.config.limits.maxLikesPerDay}`);
+      }
+      this.elements.strategyTags.replaceChildren(
+        ...tags.map((label) => {
+          const tag = document.createElement('span');
+          tag.className = 'strategy-tag';
+          tag.textContent = label;
+          return tag;
+        })
+      );
+      this.elements.strategySummary.textContent = summarizeFilters(filters);
     }
 
     update() {
@@ -2649,46 +4146,101 @@
       }
       const runner = runtime.runner;
       const status = runner?.status || 'idle';
-      const blockedUntil = getBlockedUntil();
-      const blockedText = blockedUntil > Date.now() ? ` | 冷却至 ${new Date(blockedUntil).toLocaleTimeString()}` : '';
-      const nextRefreshAt = runner?.nextRefreshAt || getScheduledRefreshAt();
-      const refreshText = nextRefreshAt > Date.now() ? ` | 下次刷新 ${new Date(nextRefreshAt).toLocaleTimeString()}` : '';
+      const stats = runner?.stats || {};
       const dailyLimitText = formatLimitValue(runtime.config.limits.maxLikesPerDay);
       this.elements.status.textContent = STATUS_TEXT[status] || status;
-      this.elements.summary.textContent = [
-        `模式：${SOURCE_MODE_TEXT[runner?.sourceMode || 'dom'] || runner?.sourceMode || '页面按钮'} | 试运行：${runtime.config.dryRun ? '开启' : '关闭'} | 自动刷新：${Math.round(runtime.config.timing.refreshIntervalMs / 60000)} 分钟`,
-        `当前页数=${runner?.stats.pages || 0} | 扫描=${runner?.stats.scanned || 0} | 命中=${runner?.stats.matched || 0}`,
-        `点赞=${runner?.stats.liked || 0} | 今日=${runtime.persisted.dailyCounter.likes}/${dailyLimitText}${blockedText}${refreshText}`,
+      this.elements.status.dataset.status = status;
+      this.elements.metricScanned.textContent = String(stats.scanned || 0);
+      this.elements.metricMatched.textContent = String(stats.matched || 0);
+      this.elements.metricLiked.textContent = String(stats.liked || 0);
+      this.elements.metricDaily.textContent = String(runtime.persisted.dailyCounter.likes || 0);
+      this.elements.historyCount.textContent = `${runtime.persisted.likeHistory.length} 条`;
+      if (!this.elements.historyBackdrop.hidden) {
+        this.renderHistory();
+      }
+      this.elements.diagnostics.textContent = [
+        `来源：${SOURCE_MODE_TEXT[runner?.sourceMode || 'dom'] || '页面按钮'} · 当前页按钮 ${runtime.domButtons.size} 个`,
+        `点赞间隔：${formatDelayRange(runtime.config.timing.actionDelayMsRange)}随机`,
+        `今日累计：${runtime.persisted.dailyCounter.likes}/${dailyLimitText} · 用户 ${runtime.currentUserId || '未知'}`,
+        `页面状态：${document.hidden ? '后台（恢复后自动校时）' : '前台'} · API 兜底${runtime.config.safety.allowApiFallback ? '已开启' : '已关闭'}`,
       ].join('\n');
 
-      this.elements.calibration.textContent = [
-        `点赞方式：优先直接点击当前页按钮`,
-        `当前页点赞按钮：${runtime.domButtons.size}`,
-        `当前用户：${runtime.currentUserId || '未知'}`,
-      ].join('\n');
+      if (runtime.persisted.lastError) {
+        this.elements.error.hidden = false;
+        this.elements.error.textContent = `最近一次异常：${runtime.persisted.lastError.message}`;
+      } else {
+        this.elements.error.hidden = true;
+        this.elements.error.textContent = '';
+      }
 
-      this.elements.error.textContent = runtime.persisted.lastError
-        ? `最近错误：${runtime.persisted.lastError.message}`
-        : '最近错误：无';
-
-      this.elements.rules.textContent = summarizeFilters(runtime.config.filters);
+      this.renderStrategy();
+      const startButton = this.elements.buttons.start;
+      const pauseButton = this.elements.buttons.pause;
+      const stopButton = this.elements.buttons.stop;
+      const dryRunButton = this.elements.buttons.toggleDryRun;
+      if (startButton) {
+        const label = startButton.querySelector('span:last-child');
+        if (label) {
+          label.textContent = status === 'paused' ? '继续' : status === 'waiting_refresh' ? '立即运行' : '开始';
+        }
+        startButton.disabled = status === 'running';
+      }
+      if (pauseButton) {
+        pauseButton.disabled = !['running', 'waiting_refresh'].includes(status);
+      }
+      if (stopButton) {
+        stopButton.disabled = !['running', 'waiting_refresh', 'paused'].includes(status);
+      }
+      if (dryRunButton) {
+        dryRunButton.classList.toggle('live', !runtime.config.dryRun);
+        dryRunButton.textContent = runtime.config.dryRun ? '安全预览' : '真实点赞';
+      }
+      this.updateClock();
     }
   }
 
   function summarizeFilters(filters) {
-    const lines = [
-      `${FILTER_LABELS.allowAuthors}：${filters.allowAuthors.join(', ') || '（空）'}`,
-      `${FILTER_LABELS.allowTopics}：${filters.allowTopics.join(', ') || '（空）'}`,
-      `${FILTER_LABELS.allowKeywords}：${filters.allowKeywords.join(', ') || '（空）'}`,
-      `${FILTER_LABELS.allowEntryTypes}：${filters.allowEntryTypes.join(', ') || '（空）'}`,
-      `${FILTER_LABELS.denyAuthors}：${filters.denyAuthors.join(', ') || '（空）'}`,
-      `${FILTER_LABELS.denyTopics}：${filters.denyTopics.join(', ') || '（空）'}`,
-      `${FILTER_LABELS.denyKeywords}：${filters.denyKeywords.join(', ') || '（空）'}`,
-      `最大时效：${isPositiveLimit(filters.maxAgeHours) ? `${filters.maxAgeHours} 小时` : '不限'} | 仅点赞未点过：${filters.onlyUnliked ? '是' : '否'}`,
-    ];
+    const previewList = (items, limit = 4) => {
+      const visible = items.slice(0, limit);
+      return `${visible.join('、')}${items.length > limit ? ` 等 ${items.length} 项` : ''}`;
+    };
+    const lines = [];
     if (!hasAnyAllowRules(filters)) {
-      lines.push('当前没有配置允许规则时，脚本会按“当前页全部可见内容”处理，只继续应用屏蔽规则、时效和未点赞限制。');
+      lines.push('范围：当前页全部可见内容');
+    } else {
+      const allowParts = [];
+      if (filters.allowEntryTypes.length) {
+        allowParts.push(`类型 ${previewList(filters.allowEntryTypes.map((type) => ENTRY_TYPE_LABELS[type] || type), 5)}`);
+      }
+      if (filters.allowKeywords.length) {
+        allowParts.push(`关键词 ${previewList(filters.allowKeywords)}`);
+      }
+      if (filters.allowAuthors.length) {
+        allowParts.push(`${filters.allowAuthors.length} 位指定作者`);
+      }
+      if (filters.allowTopics.length) {
+        allowParts.push(`${filters.allowTopics.length} 个指定话题`);
+      }
+      lines.push(`只允许：${allowParts.join('；')}`);
     }
+    const denyParts = [];
+    if (filters.denyKeywords.length) {
+      denyParts.push(`关键词 ${previewList(filters.denyKeywords)}`);
+    }
+    if (filters.denyAuthors.length) {
+      denyParts.push(`${filters.denyAuthors.length} 位作者`);
+    }
+    if (filters.denyTopics.length) {
+      denyParts.push(`${filters.denyTopics.length} 个话题`);
+    }
+    if (denyParts.length) {
+      lines.push(`优先屏蔽：${denyParts.join('；')}`);
+    }
+    lines.push(
+      isPositiveLimit(filters.maxAgeHours)
+        ? `时效：只处理 ${filters.maxAgeHours} 小时内的内容`
+        : '时效：不限制发布时间'
+    );
     return lines.join('\n');
   }
 
@@ -2702,11 +4254,11 @@
     if (
       runtime.runner &&
       ['running', 'waiting_refresh', 'paused'].includes(runtime.runner.status) &&
-      !isFeedsPage()
+      !isSupportedPage()
     ) {
       runtime.runner.stop();
-      runtime.runner.status = 'not_feeds';
-      setLastError('你已经离开动态页，脚本已自动停止。');
+      runtime.runner.status = 'not_supported';
+      setLastError('你已经离开机核动态页或话题首页，脚本已自动停止。');
     }
     updateUi();
   }
@@ -2730,6 +4282,21 @@
     window.addEventListener('hashchange', handleRouteChange);
   }
 
+  function installLifecycleObserver() {
+    const recover = (event) => {
+      if (event?.type === 'visibilitychange' && document.hidden) {
+        updateUi();
+        return;
+      }
+      runtime.runner?.recoverRefreshSchedule(event?.type || 'lifecycle');
+      updateUi();
+    };
+    document.addEventListener('visibilitychange', recover);
+    window.addEventListener('focus', recover);
+    window.addEventListener('pageshow', recover);
+    window.addEventListener('online', recover);
+  }
+
   function buildExportSnapshot() {
     return {
       exportedAt: new Date().toISOString(),
@@ -2747,6 +4314,8 @@
               status: runtime.runner.status,
               sourceMode: runtime.runner.sourceMode,
               nextRefreshAt: runtime.runner.nextRefreshAt,
+              refreshScheduleMode: runtime.runner.refreshScheduleMode,
+              refreshDelayMs: runtime.runner.refreshDelayMs,
               stats: runtime.runner.stats,
             }
           : null,
@@ -2786,17 +4355,11 @@
   }
 
   function editConfig() {
-    const nextRaw = window.prompt('编辑 GM_config JSON', JSON.stringify(runtime.config, null, 2));
-    if (!nextRaw) {
+    if (runtime.ui?.openSettings) {
+      runtime.ui.openSettings();
       return;
     }
-    const parsed = safeJsonParse(nextRaw);
-    if (!parsed) {
-      window.alert('JSON 格式无效，配置未修改。');
-      return;
-    }
-    saveConfig(parsed);
-    notify('配置已更新。');
+    notify('配置面板仍在载入，请稍后重试。');
   }
 
   function registerMenuCommands() {
@@ -2837,14 +4400,19 @@
     runtime.persisted.dailyCounter = resetDailyCounter(runtime.persisted.dailyCounter);
     savePersisted();
     saveConfig(runtime.config);
-    if (migrated.changed) {
+    if (migrated.defaultsChanged) {
+      notify('默认节奏已更新：白天 40–70 分钟、夜间 80–120 分钟，并已关闭安全预览。');
+    } else if (migrated.changed) {
       notify('已自动关闭最大时效、点赞上限和默认内容类型限制。');
     }
     registerMenuCommands();
 
-    const observer = new NetworkObserver();
-    observer.install();
+    if (runtime.config.safety.allowApiFallback) {
+      const observer = new NetworkObserver();
+      observer.install();
+    }
     installRouteObserver();
+    installLifecycleObserver();
 
     window.GCoresAutoLikeAssistant = {
       startRun() {
