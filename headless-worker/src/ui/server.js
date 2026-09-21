@@ -16,7 +16,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 
-const { PROJECT_ROOT, loadConfig, cleanText, deepMerge, readJsonFile, writeJsonFile } = require('../lib/config');
+const { PROJECT_ROOT, LOCAL_CONFIG_PATH, loadConfig, cleanText, deepMerge, isObject, readJsonFile, writeJsonFile } = require('../lib/config');
 const { Store } = require('../lib/store');
 const { loadStorageState, inspectStorageState, importFromSources, isProfileLocked } = require('../lib/session');
 const { createLogger } = require('../lib/runner');
@@ -245,13 +245,53 @@ function startJob(argv, label) {
 function saveSettings(config, patch) {
   const current = readJsonFile(path.join(PROJECT_ROOT, 'config.json'));
   const merged = deepMerge(current, patch);
-  // token 只允许写不读：为空表示"保持原样"。
-  if (merged.notifications && !cleanText(merged.notifications.pushplusToken)) {
-    const existing = (current.notifications && current.notifications.pushplusToken) || '';
-    merged.notifications.pushplusToken = existing;
+  // config.json 是要入库（且仓库公开）的文件，绝不能落 token：这里恒定写空串。
+  // 真实值只存在于 gitignore 的 config.local.json，由 savePushPlusToken 负责。
+  // 顺带也把历史上可能误写进来的值清掉。
+  if (merged.notifications) {
+    merged.notifications.pushplusToken = '';
   }
   writeJsonFile(path.join(PROJECT_ROOT, 'config.json'), merged);
   return loadConfig();
+}
+
+/**
+ * 保存 PushPlus token —— 只写 config.local.json（gitignore 的私密文件）。
+ * 传空串表示清空。
+ *
+ * 绝不回显 token：对外只暴露 hasToken 布尔值。
+ */
+function savePushPlusToken(token) {
+  const value = cleanText(token);
+
+  let local = {};
+  if (fs.existsSync(LOCAL_CONFIG_PATH)) {
+    try {
+      local = readJsonFile(LOCAL_CONFIG_PATH);
+    } catch (error) {
+      local = {};
+    }
+  }
+  if (!isObject(local)) local = {};
+  if (!isObject(local.notifications)) local.notifications = {};
+
+  if (value) local.notifications.pushplusToken = value;
+  else delete local.notifications.pushplusToken;
+
+  writeJsonFile(LOCAL_CONFIG_PATH, local);
+
+  // 防御：确保 config.json 里没有残留的 token（比如手改过）。
+  try {
+    const publicConfig = readJsonFile(path.join(PROJECT_ROOT, 'config.json'));
+    if (isObject(publicConfig.notifications) && cleanText(publicConfig.notifications.pushplusToken)) {
+      publicConfig.notifications.pushplusToken = '';
+      writeJsonFile(path.join(PROJECT_ROOT, 'config.json'), publicConfig);
+    }
+  } catch (error) {
+    // 读不到就算了，不影响 token 本身的保存
+  }
+
+  return { ok: true, hasToken: Boolean(value) };
 }
 
 async function importSession(config) {
@@ -392,6 +432,18 @@ function startServer(config) {
           }
         }
         sendJson(res, 200, payload);
+        return;
+      }
+
+      // 单独开一个端点处理凭据，避免它走通用配置写入路径。
+      if (url.pathname === '/api/config/token') {
+        const value = typeof body.token === 'string' ? body.token : '';
+        const result = savePushPlusToken(value);
+        sendJson(res, 200, {
+          ok: true,
+          message: result.hasToken ? 'token 已保存到 config.local.json' : 'token 已清空',
+          hasToken: result.hasToken,
+        });
         return;
       }
 

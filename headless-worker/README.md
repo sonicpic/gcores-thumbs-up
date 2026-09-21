@@ -198,6 +198,22 @@ npm run gc:task:install -- --s4u --force      # 必须在管理员 PowerShell �
 
 v0.2 的平铺配置（`headless` / `storage.*` / `daemon.*`）会自动迁移，无需手工改。
 
+### PushPlus token
+
+**不要**手写到 `config.json`——那是会入库的公开文件。token 只应存在于
+`config.local.json`（已 gitignore），有两种写入方式：
+
+| 方式 | 说明 |
+| --- | --- |
+| 控制台（推荐） | 设置页 → `PushPlus token` 输入框，填好点保存。输入框是密码类型、不回显原值，只显示「已配置 / 未配置」 |
+| 命令行 | `set PUSHPLUS_TOKEN=xxx` 环境变量，优先级最高 |
+
+- 输入框**留空 = 保持当前值**，不会误清已配置的 token。
+- 要彻底移除，点输入框右侧的「清空」按钮。
+- 保存普通配置时，控制台会强制把 `config.json` 里的 `notifications.pushplusToken`
+  写成空串——即便历史上误填过，也会在下一次保存时被自动擦除。
+- 读取优先级：`process.env.PUSHPLUS_TOKEN` > `config.local.json` > `config.json`。
+
 ## 数据文件
 
 | 文件 | 说明 |

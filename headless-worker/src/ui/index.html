@@ -120,6 +120,14 @@
         <div class="row"><label>每日最多点赞</label><input type="number" id="l-maxLikesPerDay" min="0" placeholder="0 = 不限"></div>
         <div class="row"><label>调度间隔（分钟）</label><input type="number" id="s-interval" min="1"></div>
         <div class="row"><label>动作间隔（毫秒）</label><input type="text" id="t-delay" placeholder="2500,7000"></div>
+        <div class="row">
+          <label>PushPlus token</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="password" id="n-token" placeholder="填写即替换；留空=保持当前值" autocomplete="off">
+            <button id="btn-token-clear" class="ghost-danger">清空</button>
+          </div>
+        </div>
+        <div class="hint" id="tokenhint"></div>
         <div class="row"><label>风控冷却（分钟）</label><input type="number" id="t-cooldown" min="1"></div>
       </div>
     </div>
@@ -244,8 +252,15 @@ function render(o){
   check('n-onSessionExpired', c.notifications.onSessionExpired);
   check('n-onRunSummary', c.notifications.onRunSummary);
 
-  if (!o.config.notifications.hasToken) {
-    $('actionhint').innerHTML = '未配置 PushPlus token（config.local.json），通知按钮会失败。其余按钮等同于命令行里的 <code>npm run gc:dry / gc:run</code>。';
+  const hasTok = Boolean(o.config.notifications.hasToken);
+  const th = $('tokenhint');
+  if (th) {
+    th.innerHTML = hasTok
+      ? '当前：<span class="pill p-ok">已配置</span> 出于安全不会回显原值，填新的即替换。只写入 gitignore 的 <code>config.local.json</code>，不会进 <code>config.json</code>，因此不会被提交。'
+      : '当前：<span class="pill p-warn">未配置</span> 填好后点「保存设置」即可；也可改用环境变量 <code>PUSHPLUS_TOKEN</code>（优先级更高）。';
+  }
+  if (!hasTok) {
+    $('actionhint').innerHTML = '未配置 PushPlus token，通知相关按钮会失败 —— 可直接在右侧「PushPlus token」里填。其余按钮等同于命令行里的 <code>npm run gc:dry / gc:run</code>。';
   }
 }
 
@@ -267,7 +282,7 @@ function renderJob(j){
 }
 
 function setButtons(busy){
-  ['btn-dry','btn-run','btn-import','btn-notify','btn-task-install','btn-task-start','btn-task-stop','btn-task-remove','btn-save','btn-reset']
+  ['btn-dry','btn-run','btn-import','btn-notify','btn-task-install','btn-task-start','btn-task-stop','btn-task-remove','btn-save','btn-reset','btn-token-clear']
     .forEach(id => { const el = $(id); if (el) el.disabled = busy; });
 }
 
@@ -292,6 +307,14 @@ function range(id, fallback){
 }
 
 async function save(){
+  // 凭据单独走 /api/config/token，绝不混进普通配置 patch（那个会写入要入库的 config.json）
+  const tokEl = $('n-token');
+  const tok = tokEl ? tokEl.value.trim() : '';
+  if (tok) {
+    const r = await post('/api/config/token', { token: tok });
+    if (!r.ok) { toast(r.message || 'token 保存失败'); return; }
+    if (tokEl) tokEl.value = '';
+  }
   const patch = {
     filters: {
       allowAuthors: csv('f-allowAuthors'), allowTopics: csv('f-allowTopics'),
@@ -310,7 +333,7 @@ async function save(){
   const data = await post('/api/config', { patch });
   if (data.ok) {
     clearDirty();
-    toast(data.message || '设置已保存');
+    toast(tok ? 'token 与设置已保存' : (data.message || '设置已保存'));
     load();
   }
 }
@@ -326,7 +349,7 @@ function on(id, fn){
 
 // 未保存修改保护：一旦用户动过设置表单，轮询刷新就不再回写输入框，
 // 否则 15 秒一次的自动刷新会把用户还没保存的编辑悄悄覆盖掉。
-const FORM_IDS = ['f-allowAuthors','f-allowTopics','f-allowKeywords','f-allowEntryTypes','f-denyAuthors','f-denyTopics','f-denyKeywords','f-maxAgeHours','l-maxLikesPerRun','l-maxLikesPerDay','s-interval','t-delay','t-cooldown','f-onlyUnliked','n-enabled','n-onLike','n-onFailure','n-onSessionExpired','n-onRunSummary'];
+const FORM_IDS = ['f-allowAuthors','f-allowTopics','f-allowKeywords','f-allowEntryTypes','f-denyAuthors','f-denyTopics','f-denyKeywords','f-maxAgeHours','l-maxLikesPerRun','l-maxLikesPerDay','s-interval','t-delay','t-cooldown','n-token','f-onlyUnliked','n-enabled','n-onLike','n-onFailure','n-onSessionExpired','n-onRunSummary'];
 let formDirty = false;
 
 function setDirty(){
@@ -354,6 +377,11 @@ on('btn-task-install', () => { post('/api/task', { action:'install' }).then(r =>
 on('btn-task-start', () => { if (confirm('启用计划任务？启用后会自动按配置的间隔定期运行。')) post('/api/task', { action:'start' }).then(r => { if (r.ok) toast('正在启用…'); }); });
 on('btn-task-stop', () => { if (confirm('停止计划任务？停止后不再自动运行（任务保留，可随时重新启用）。')) post('/api/task', { action:'stop' }).then(r => { if (r.ok) toast('正在停止…'); }); });
 on('btn-task-remove', () => { if (confirm('确定删除计划任务？删除后不会再自动运行。')) post('/api/task', { action:'remove' }).then(() => toast('正在删除…')); });
+on('btn-token-clear', async () => {
+  if (!confirm('清空 PushPlus token？清空后通知功能将不可用。')) return;
+  const r = await post('/api/config/token', { token: '' });
+  if (r.ok) { toast('token 已清空'); load(); } else { toast(r.message || '清空失败'); }
+});
 on('btn-save', save);
 on('btn-reset', () => { if (confirm('清空已处理记录？清空后已点赞过的动态会被重新扫描（通常会被跳过，因为已点赞）。')) post('/api/state/reset').then(r => { if (r.ok) toast('已清空'); load(); }); });
 
