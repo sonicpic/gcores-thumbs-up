@@ -247,6 +247,39 @@ async function waitForFeed(page, timeoutMs) {
   return items;
 }
 
+/**
+ * 采集动态：首屏等渲染（沿用 waitForFeed 语义），scrollRounds>1 时
+ * 向下滚动触发懒加载，等条目数稳定后取最新一次全量提取。
+ * maxItems 兜底：无论滚多少轮，超过上限就停，防单轮失控。
+ */
+async function collectItems(page, config) {
+  const rounds = Math.max(1, Math.min(10, Number(config.run.scrollRounds) || 1));
+  const maxItems = 80;
+  let items = await waitForFeed(page, config.run.waitForFeedMs);
+
+  for (let round = 1; round < rounds && items.length < maxItems; round += 1) {
+    const before = items.length;
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    // 最多等 8 秒：条目数两次采样不再增长即认为这一轮加载完毕。
+    const deadline = Date.now() + 8000;
+    let stable = 0;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(700);
+      const next = await pageDomAction(page, 'extract');
+      if (next.length === items.length) {
+        stable += 1;
+        if (stable >= 2) break;
+      } else {
+        stable = 0;
+        items = next;
+      }
+    }
+    items = await pageDomAction(page, 'extract');
+    if (items.length === before) break; // 滚了也没新内容，提前收工
+  }
+  return items.slice(0, maxItems);
+}
+
 /** 记录 /votes 请求的响应码，用来识别风控（401/403/429）。 */
 function createVoteTracker(page) {
   const records = [];
@@ -339,6 +372,7 @@ module.exports = {
   hasLoginPrompt,
   extractItems,
   waitForFeed,
+  collectItems,
   createVoteTracker,
   clickLike,
   captureErrorScreenshot,

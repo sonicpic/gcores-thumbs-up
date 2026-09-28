@@ -265,6 +265,10 @@ async function commandDoctor(config) {
 
   push('== 运行环境 ==');
   push(`  Node        : ${process.version} (${process.platform}/${process.arch})`);
+  const major = Number(process.versions.node.split('.')[0]);
+  if (Number.isFinite(major) && major < 20) {
+    push(`  ⚠ Node ${major} 已停止安全维护（EOL），建议升级到 20/22 LTS；当前仍可运行。`);
+  }
   push(`  SESSIONNAME : ${process.env.SESSIONNAME || '(非交互会话)'}`);
   push(`  项目目录    : ${PROJECT_ROOT}`);
 
@@ -312,6 +316,9 @@ async function commandDoctor(config) {
   push('== 调度与通知 ==');
   push(`  调度方式    : Windows 计划任务（任务名 ${config.schedule.taskName}）`);
   push(`  间隔        : ${config.schedule.intervalMinutes} 分钟`);
+  const ah = config.schedule.activeHours;
+  push(`  活跃时段    : ${ah.enabled ? `${ah.start} ~ ${ah.end}${ah.start > ah.end ? '（跨零点）' : ''}` : '全天'}`);
+  push(`  滚动轮数    : ${config.run.scrollRounds}（1 = 只处理首屏）`);
   push(`  PushPlus    : ${config.notifications.enabled ? (process.env.PUSHPLUS_TOKEN || config.notifications.pushplusToken ? '已配置 ✔' : '未配置 token') : '已关闭'}`);
   push(`  单轮硬超时  : ${Math.round(config.run.maxRunMs / 1000)} 秒`);
 
@@ -333,6 +340,7 @@ async function commandDoctor(config) {
     push('  暂无记录');
   }
   push(`  累计        : ${store.state.totals.runs} 轮 / 点赞 ${store.state.totals.liked} 次`);
+  push(`  留档        : 运行历史 ${store.state.history.length} 条 / 点赞明细 ${store.state.likes.length} 条`);
   if (store.state.cooldown.blockedUntil > Date.now()) {
     push(`  冷却中      : 至 ${new Date(store.state.cooldown.blockedUntil).toLocaleString('zh-CN', { hour12: false })}`);
   }

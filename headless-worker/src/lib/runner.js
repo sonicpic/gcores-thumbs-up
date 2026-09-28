@@ -1,7 +1,7 @@
 'use strict';
 
 const path = require('path');
-const { cleanText } = require('./config');
+const { cleanText, parseClock } = require('./config');
 const { Logger } = require('./logger');
 const { Store } = require('./store');
 const { createNotifier } = require('./notify');
@@ -9,13 +9,16 @@ const { evaluateItem } = require('./rules');
 const {
   BlockedRequestError,
   SessionExpiredError,
-  waitForFeed,
+  collectItems,
   createVoteTracker,
   clickLike,
   captureErrorScreenshot,
   gotoFeeds,
 } = require('./gcores');
 const { launchBrowser, newSessionContext, loadStorageState, saveStorageState, inspectStorageState } = require('./session');
+
+/** 登录凭证剩余天数低于该值时，每天提醒一次（走 PushPlus 的"登录失效"开关）。 */
+const CREDENTIAL_WARN_DAYS = 14;
 
 function randomBetween(minValue, maxValue) {
   if (maxValue <= minValue) return minValue;
@@ -24,6 +27,20 @@ function randomBetween(minValue, maxValue) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 是否处于活跃时段。disabled 恒真；start==end 视为全天；
+ * start<end 是普通窗口，start>end 是跨零点窗口（如 22:00~07:00）。两端均含。
+ */
+function isWithinActiveHours(schedule, now = new Date()) {
+  const hours = schedule && schedule.activeHours;
+  if (!hours || hours.enabled !== true) return true;
+  const start = parseClock(hours.start);
+  const end = parseClock(hours.end);
+  if (start === null || end === null || start === end) return true;
+  const minute = now.getHours() * 60 + now.getMinutes();
+  return start < end ? minute >= start && minute <= end : minute >= start || minute <= end;
 }
 
 function projectPath(root, relativePath) {
@@ -83,6 +100,12 @@ async function runRound({ config, root, dryRun = false, logger = null }) {
     return finish({ ok: true, skipped: 'cooldown' });
   }
 
+  if (!isWithinActiveHours(config.schedule)) {
+    const hours = config.schedule.activeHours;
+    log.info(`当前不在活跃时段（${hours.start}~${hours.end}），跳过本轮`);
+    return finish({ ok: true, skipped: 'inactive-hours' });
+  }
+
   if (store.hasReachedDailyLimit(config)) {
     log.info(`今日点赞数已达上限 ${config.limits.maxLikesPerDay}，跳过本轮`);
     return finish({ ok: true, skipped: 'daily-limit' });
@@ -127,7 +150,7 @@ async function runRound({ config, root, dryRun = false, logger = null }) {
 
     await gotoFeeds(page, config, log);
 
-    const items = await waitForFeed(page, config.run.waitForFeedMs);
+    const items = await collectItems(page, config);
     if (!items.length) {
       log.error('当前页没有发现可处理的点赞按钮，可能页面结构变化或加载异常');
       if (config.run.screenshotOnError) {
@@ -138,7 +161,9 @@ async function runRound({ config, root, dryRun = false, logger = null }) {
     }
 
     store.setSessionResult({ ok: true });
-    log.info(`本轮发现 ${items.length} 个当前页点赞按钮${dryRun ? '（试运行，不会真的点赞）' : ''}`);
+    log.info(
+      `本轮发现 ${items.length} 个当前页点赞按钮${config.run.scrollRounds > 1 ? `（滚动 ${config.run.scrollRounds} 轮）` : ''}${dryRun ? '（试运行，不会真的点赞）' : ''}`
+    );
 
     for (const item of items) {
       if (aborted) {
@@ -192,6 +217,7 @@ async function runRound({ config, root, dryRun = false, logger = null }) {
           stats.consecutiveErrors = 0;
           store.markProcessed(item.itemKey, result.mode || 'liked');
           store.incrementDailyLikes();
+          store.recordLike({ at: new Date().toISOString(), title: item.title, type: item.targetType, url: item.url, key: item.itemKey });
           log.info(`已点赞：${item.title}`);
           await notifier.likeResult({ item, resultText: '成功', detailText: result.mode || 'liked', stats });
         }
@@ -223,6 +249,14 @@ async function runRound({ config, root, dryRun = false, logger = null }) {
         store.setSessionResult({ ok: true, cookieExpiresAt: info.authExpiresAt });
         if (info.authDaysLeft !== null && info.authDaysLeft <= 7) {
           log.warn(`登录凭证将在约 ${info.authDaysLeft} 天后过期，建议提前重新导入登录态`);
+        }
+        // 剩余寿命进入提醒窗口时，每天推一次 PushPlus（跟随"登录失效时通知"开关去重）。
+        if (info.authDaysLeft !== null && info.authDaysLeft <= CREDENTIAL_WARN_DAYS) {
+          if (store.consumeCredentialReminderDay(info.authDaysLeft)) {
+            store.save();
+            log.warn(`登录凭证剩余约 ${info.authDaysLeft} 天，已发送到期提醒`);
+            await notifier.credentialExpiring({ daysLeft: info.authDaysLeft, expiresAt: info.authExpiresAt });
+          }
         }
       } catch (error) {
         log.debug(`回写登录态失败：${cleanText(error.message)}`);
@@ -264,4 +298,4 @@ async function runRound({ config, root, dryRun = false, logger = null }) {
   }
 }
 
-module.exports = { runRound, createLogger, projectPath, randomBetween, sleep };
+module.exports = { runRound, createLogger, projectPath, randomBetween, sleep, isWithinActiveHours, CREDENTIAL_WARN_DAYS };

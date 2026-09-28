@@ -44,13 +44,55 @@ function pushLine(text) {
     });
 }
 
-function readLogTail(lines = 60) {
+/**
+ * SSE 日志流：先推最近 200 行（init 事件），之后每秒增量推送新行。
+ * 控制台是按需启动的短命进程，页面一关连接即断，不会留后台定时器。
+ * 日志按大小轮转（worker.log → worker.log.1）时 size 会变小，按重置处理。
+ */
+function startLogStream(config, req, res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store',
+    connection: 'keep-alive',
+  });
+  let offset = 0;
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const file = projectPath(config.paths.logFile);
   try {
-    const content = fs.readFileSync(projectPath(loadConfig().paths.logFile), 'utf8');
-    return content.trim().split('\n').slice(-lines);
+    const content = fs.readFileSync(file, 'utf8');
+    offset = Buffer.byteLength(content, 'utf8');
+    send('init', { lines: content.trim().split('\n').slice(-200).filter((line) => line.length) });
   } catch (error) {
-    return [];
+    send('init', { lines: [] });
   }
+  const timer = setInterval(() => {
+    try {
+      const stat = fs.statSync(file);
+      if (stat.size === offset) return;
+      if (stat.size < offset) offset = 0; // 轮转后从头读
+      const length = stat.size - offset;
+      const fd = fs.openSync(file, 'r');
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, offset);
+      fs.closeSync(fd);
+      offset = stat.size;
+      const lines = buffer.toString('utf8').split('\n').filter((line) => line.length);
+      if (lines.length) send('lines', { lines });
+    } catch (error) {
+      /* 文件暂不可读就跳过这一拍 */
+    }
+  }, 1000);
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch (error) {
+      /* 已断开 */
+    }
+  }, 15000);
+  req.on('close', () => {
+    clearInterval(timer);
+    clearInterval(heartbeat);
+  });
 }
 
 function fileInfo(file) {
@@ -185,12 +227,15 @@ function buildOverview(config) {
       sessionSource: store.state.session.source,
       lastCheckAt: store.state.session.lastCheckAt,
       lastError: store.state.session.lastError,
+      history: store.state.history,
+      likes: store.state.likes,
     },
     config: {
       schedule: config.schedule,
       limits: config.limits,
       timing: config.timing,
       filters: config.filters,
+      run: { scrollRounds: config.run.scrollRounds, maxRunMs: config.run.maxRunMs },
       notifications: {
         enabled: config.notifications.enabled,
         hasToken: Boolean(process.env.PUSHPLUS_TOKEN || config.notifications.pushplusToken),
@@ -203,7 +248,34 @@ function buildOverview(config) {
       ui: { port: config.ui.port },
     },
     logging: fileInfo(projectPath(config.paths.logFile)),
-    logTail: readLogTail(60),
+    screenshot: fileInfo(projectPath(config.paths.errorScreenshotFile)),
+  };
+}
+
+/** 备份导出内容：可入库的配置节（不含 token）+ 运行时记录。 */
+function buildBackup(config) {
+  const store = new Store(projectPath(config.paths.stateFile));
+  return {
+    kind: 'gcores-thumbs-up-backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    config: {
+      schedule: config.schedule,
+      limits: config.limits,
+      timing: config.timing,
+      filters: config.filters,
+      run: { scrollRounds: config.run.scrollRounds },
+      notifications: {
+        enabled: config.notifications.enabled,
+        onLike: config.notifications.onLike,
+        onFailure: config.notifications.onFailure,
+        onSessionExpired: config.notifications.onSessionExpired,
+        onRunSummary: config.notifications.onRunSummary,
+      },
+    },
+    processed: store.state.processed,
+    likes: store.state.likes,
+    totals: store.state.totals,
   };
 }
 
@@ -394,6 +466,38 @@ function startServer(config) {
         return;
       }
 
+      // 日志实时流（SSE）。放在 JSON 端点之前判断，响应类型不同。
+      if (req.method === 'GET' && url.pathname === '/api/log/stream') {
+        startLogStream(loadConfig(), req, res);
+        return;
+      }
+
+      // 最近一次失败截图。<img> 标签带不了自定义 header，token 走 query。
+      if (req.method === 'GET' && url.pathname === '/api/screenshot') {
+        const file = projectPath(loadConfig().paths.errorScreenshotFile);
+        try {
+          const png = fs.readFileSync(file);
+          res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-store' });
+          res.end(png);
+        } catch (error) {
+          sendJson(res, 404, { ok: false, message: '暂无失败截图' });
+        }
+        return;
+      }
+
+      // 备份下载（浏览器直接另存为，token 同样走 query）。
+      if (req.method === 'GET' && url.pathname === '/api/backup') {
+        const backup = buildBackup(loadConfig());
+        const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '');
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-disposition': `attachment; filename="gcores-backup-${stamp}.json"`,
+          'cache-control': 'no-store',
+        });
+        res.end(JSON.stringify(backup, null, 2));
+        return;
+      }
+
       if (req.method !== 'POST') {
         sendJson(res, 405, { ok: false, message: 'method not allowed' });
         return;
@@ -480,6 +584,58 @@ function startServer(config) {
         store.state.dailyCounter = { date: '', likes: 0 };
         store.save();
         sendJson(res, 200, { ok: true, message: '运行时状态已清空' });
+        return;
+      }
+
+      // 手动解除风控冷却：不必再等冷却期自然过期，也不必清空全部状态。
+      if (url.pathname === '/api/cooldown/clear') {
+        const store = new Store(projectPath(live.paths.stateFile));
+        if (!store.state.cooldown.blockedUntil) {
+          sendJson(res, 200, { ok: true, message: '当前不在冷却期' });
+          return;
+        }
+        store.clearCooldown();
+        store.save();
+        sendJson(res, 200, { ok: true, message: '冷却已解除，下一轮照常执行' });
+        return;
+      }
+
+      // 备份恢复：配置节（不含 token）+ 已处理记录，可整体或分别恢复。
+      if (url.pathname === '/api/backup') {
+        const backup = isObject(body) ? body : {};
+        const messages = [];
+        if (isObject(backup.config)) {
+          const patch = {};
+          ['schedule', 'limits', 'timing', 'filters', 'run'].forEach((key) => {
+            if (isObject(backup.config[key])) patch[key] = backup.config[key];
+          });
+          if (isObject(backup.config.notifications)) {
+            patch.notifications = {
+              enabled: Boolean(backup.config.notifications.enabled),
+              onLike: Boolean(backup.config.notifications.onLike),
+              onFailure: Boolean(backup.config.notifications.onFailure),
+              onSessionExpired: Boolean(backup.config.notifications.onSessionExpired),
+              onRunSummary: Boolean(backup.config.notifications.onRunSummary),
+            };
+          }
+          if (Object.keys(patch).length) {
+            saveSettings(live, patch);
+            messages.push(`配置（${Object.keys(patch).join('、')}）`);
+          }
+        }
+        if (isObject(backup.processed)) {
+          const store = new Store(projectPath(live.paths.stateFile));
+          Object.entries(backup.processed).forEach(([key, entry]) => {
+            if (!key || !isObject(entry)) return;
+            store.state.processed[String(key)] = { ts: Number(entry.ts) || 0, status: String(entry.status || 'processed') };
+          });
+          store.save();
+          messages.push(`已处理记录 ${Object.keys(store.state.processed).length} 条`);
+        }
+        sendJson(res, 200, {
+          ok: messages.length > 0,
+          message: messages.length ? `已恢复：${messages.join('；')}` : '备份里没有可恢复的内容（缺少 config / processed）',
+        });
         return;
       }
 

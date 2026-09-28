@@ -107,15 +107,25 @@ npm test              # 单元测试
 不装任何东西，**双击 `tools\gc-ui.cmd`** 就会：
 
 1. 启动一个只监听本机 `127.0.0.1:7317` 的小型网页服务；
-2. 用默认浏览器打开控制台页面（每次生成一次性 token，只有本机能开）；
-3. 页面上可以直接：**试运行 / 立即点赞一轮 / 重新导入登录态 / 测试通知 / 注册计划任务**，
-   还能**改筛选规则、限速、调度间隔**（保存即生效），实时看状态与日志。
+2. 用默认浏览器打开控制台页面（每次生成一次性 token，只有本机能开；
+   打开后 token 存入 localStorage 并从地址栏清除，不留在浏览器历史里）；
+3. 页面能力：
+   - **状态总览**：今日/累计点赞、近 14 天趋势图、近 48 轮柱状图（失败轮标红）、
+     计划任务下次运行倒计时、登录凭证剩余寿命进度条、冷却状态；
+   - **最近点赞列表**：留档最近 300 条（时间可对、标题可点回机核原文）；
+   - **实时日志**：SSE 流式推送 `worker.log`（含彩色分级），手动任务输出自动切换视图；
+   - **一键操作**：试运行 / 立即点赞 / 导入登录态 / 测试通知 / 任务启停注册删除 /
+     解除风控冷却 / 查看失败截图；
+   - **设置**：筛选规则、限制与调度（含活跃时段、滚动轮数）、通知开关，四个分组页签；
+   - **维护**：备份导出/导入（筛选规则 + 调度设置 + 已处理记录，JSON 文件，不含 token）；
+   - 明暗双主题（跟随系统，可手动切换并记住）。
 
 关掉那个黑色命令行窗口（或关掉页面）服务就停，**不留常驻进程**。
 想改端口就改 `config.json` 里的 `ui.port`。
 
 > 控制台只是"遥控器"，底层跑的还是同一个 `src/cli.js`；它自己**不常驻**，
-> 所以不增加任何后台占用。
+> 所以不增加任何后台占用。运行历史与点赞明细由 worker 落盘在
+> `state.json`（`history` 最近 200 轮 / `likes` 最近 300 条），控制台只是展示方。
 
 ## 接入计划任务（核心步骤）
 
@@ -187,16 +197,21 @@ npm run gc:task:install -- --s4u --force      # 必须在管理员 PowerShell �
 | `browser.channel` | `chromium`（自带内核）/ `msedge` / `chrome` |
 | `ui.port` / `ui.openBrowser` | 控制台监听端口 / 启动时是否自动开浏览器 |
 | `schedule.intervalMinutes` | 调度间隔 |
+| `schedule.activeHours` | 活跃时段 `{enabled,start,end}`；`enabled:false` 全天运行；支持跨零点（如 `22:00`~`07:00`），时段外的轮次静默跳过 |
 | `run.maxRunMs` | 单轮硬超时 |
 | `run.screenshotOnError` | 失败时截图（无头下同样有效） |
+| `run.scrollRounds` | 滚动加载轮数，默认 `1`（只处理首屏）；调大可覆盖更多动态，单轮封顶 80 条、最多 10 轮 |
 | `limits.maxLikesPerRun` / `maxLikesPerDay` | `0` 表示不限 |
 | `timing.actionDelayMsRange` | 每个点赞动作之间的随机抖动 |
 | `timing.jitterMsRange` | 每轮开始前的随机等待（避免执行时刻过于规律） |
-| `timing.cooldownAfterBlockMs` | 命中 401/403/429 后的冷却时长 |
+| `timing.cooldownAfterBlockMs` | 命中 401/403/429 后的冷却时长（控制台可手动解除） |
 | `filters.*` | `allow*` 任一命中即通过；`deny*` 一票否决；留空表示全收 |
 | `notifications.*` | PushPlus 开关与分场景开关（`onLike` / `onFailure` / `onSessionExpired` / `onRunSummary`） |
 
 v0.2 的平铺配置（`headless` / `storage.*` / `daemon.*`）会自动迁移，无需手工改。
+
+> 登录凭证剩余不足 14 天时，worker 会**每天推一次** PushPlus 到期提醒
+> （跟随 `notifications.onSessionExpired` 开关），避免静默失效。
 
 ### PushPlus token
 
@@ -219,9 +234,9 @@ v0.2 的平铺配置（`headless` / `storage.*` / `daemon.*`）会自动迁移�
 | 文件 | 说明 |
 | --- | --- |
 | `.gcores-auto-like/session.json` | 登录态（纯文本 cookie，注意保密） |
-| `.gcores-auto-like/state.json` | 已处理条目 / 每日计数 / 冷却 / 会话健康度 |
+| `.gcores-auto-like/state.json` | 已处理条目 / 每日计数 / 冷却 / 会话健康度 / 运行历史（200 轮）/ 点赞明细（300 条） |
 | `.gcores-auto-like/worker.log` | 运行日志，超 2MB 自动轮转保留 3 份 |
-| `.gcores-auto-like/last-error.png` | 最近一次失败的整页截图 |
+| `.gcores-auto-like/last-error.png` | 最近一次失败的整页截图（控制台可直接查看） |
 
 ## 代码结构
 

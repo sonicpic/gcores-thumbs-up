@@ -63,6 +63,8 @@ const DEFAULT_CONFIG = {
     // 单轮硬超时，防止任何一步卡死拖垮整个调度。
     maxRunMs: 300000,
     screenshotOnError: true,
+    // 滚动加载轮数：1 = 只处理首屏（v0.2 语义）；>1 = 每多一轮向下滚动一次等加载。
+    scrollRounds: 1,
   },
   limits: {
     maxLikesPerRun: 0,
@@ -78,6 +80,8 @@ const DEFAULT_CONFIG = {
   schedule: {
     intervalMinutes: 30,
     taskName: 'GcoresAutoLike',
+    // 活跃时段窗口：enabled=false 时全天运行；支持跨零点（如 22:00~07:00）。
+    activeHours: { enabled: false, start: '08:00', end: '23:59' },
   },
   notifications: {
     enabled: true,
@@ -169,6 +173,28 @@ function sanitizeRange(value, fallback) {
   return [Math.min(minValue, maxValue), Math.max(minValue, maxValue)];
 }
 
+/** "HH:MM" → 当天分钟数；不合法返回 null。 */
+function parseClock(value) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(cleanText(value));
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+function sanitizeActiveHours(value) {
+  const base = DEFAULT_CONFIG.schedule.activeHours;
+  const raw = isObject(value) ? value : {};
+  const start = parseClock(raw.start);
+  const end = parseClock(raw.end);
+  return {
+    enabled: raw.enabled === true,
+    start: start === null ? base.start : cleanText(raw.start),
+    end: end === null ? base.end : cleanText(raw.end),
+  };
+}
+
 /**
  * 把 v0.2 的旧配置（headless / storage.* / daemon.* 平铺结构）平滑迁移到新结构。
  */
@@ -231,6 +257,8 @@ function sanitizeConfig(config) {
   merged.run.navigationRetries = clampNumber(merged.run.navigationRetries, DEFAULT_CONFIG.run.navigationRetries, 1);
   merged.run.maxRunMs = clampNumber(merged.run.maxRunMs, DEFAULT_CONFIG.run.maxRunMs, 10000);
   merged.run.screenshotOnError = merged.run.screenshotOnError !== false;
+  merged.run.scrollRounds = clampNumber(merged.run.scrollRounds, DEFAULT_CONFIG.run.scrollRounds, 1);
+  if (merged.run.scrollRounds > 10) merged.run.scrollRounds = 10;
 
   merged.limits.maxLikesPerRun = clampNumber(merged.limits.maxLikesPerRun, 0, 0);
   merged.limits.maxLikesPerDay = clampNumber(merged.limits.maxLikesPerDay, 0, 0);
@@ -241,6 +269,7 @@ function sanitizeConfig(config) {
 
   merged.schedule.intervalMinutes = clampNumber(merged.schedule.intervalMinutes, DEFAULT_CONFIG.schedule.intervalMinutes, 1);
   merged.schedule.taskName = cleanText(merged.schedule.taskName || DEFAULT_CONFIG.schedule.taskName);
+  merged.schedule.activeHours = sanitizeActiveHours(merged.schedule.activeHours);
 
   merged.notifications.enabled = merged.notifications.enabled !== false;
   merged.notifications.pushplusToken = cleanText(merged.notifications.pushplusToken || '');
@@ -301,6 +330,7 @@ module.exports = {
   normalizeToken,
   normalizeStringList,
   clampNumber,
+  parseClock,
   readJsonFile,
   writeJsonFile,
 };

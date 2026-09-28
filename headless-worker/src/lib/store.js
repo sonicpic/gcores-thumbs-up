@@ -6,6 +6,8 @@ const path = require('path');
 const { clampNumber, isObject } = require('./config');
 
 const PROCESSED_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const HISTORY_LIMIT = 200;
+const LIKES_LOG_LIMIT = 300;
 const STATE_VERSION = 2;
 
 const DEFAULT_STATE = {
@@ -14,6 +16,12 @@ const DEFAULT_STATE = {
   dailyCounter: { date: '', likes: 0 },
   cooldown: { blockedUntil: 0, reason: '' },
   session: { lastOkAt: 0, lastCheckAt: 0, lastError: null, cookieExpiresAt: 0, source: '' },
+  // 最近 N 轮的紧凑摘要（环形，新的在前），供控制台画趋势图。
+  history: [],
+  // 最近点赞明细（新的在前），供控制台展示"最近点赞列表"。
+  likes: [],
+  // 凭证到期提醒的去重标记：每天最多提醒一次。
+  credentialReminder: { lastWarnDate: '' },
   lastRun: null,
   totals: { runs: 0, liked: 0 },
 };
@@ -47,6 +55,43 @@ function trimProcessedCache(processed, now = Date.now()) {
   return next;
 }
 
+/** 压缩一条历史记录：只留控制台画图需要的字段，不带 matchedItems 明细。 */
+function compactHistoryEntry(summary) {
+  const stats = summary && isObject(summary.stats) ? summary.stats : {};
+  return {
+    at: summary && summary.startedAt ? summary.startedAt : new Date().toISOString(),
+    ok: Boolean(summary && summary.ok),
+    skipped: String((summary && summary.skipped) || ''),
+    dryRun: Boolean(summary && summary.dryRun),
+    scanned: clampNumber(stats.scanned, 0, 0),
+    matched: clampNumber(stats.matched, 0, 0),
+    liked: clampNumber(stats.liked, 0, 0),
+    durationMs: clampNumber(summary && summary.durationMs, 0, 0),
+    jitterMs: clampNumber(summary && summary.jitterMs, 0, 0),
+    error: summary && summary.error && summary.error.message ? String(summary.error.message) : '',
+  };
+}
+
+function sanitizeHistory(list) {
+  if (!Array.isArray(list)) return [];
+  return list.filter(isObject).slice(0, HISTORY_LIMIT);
+}
+
+function sanitizeLikes(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter(isObject)
+    .map((entry) => ({
+      at: String(entry.at || ''),
+      title: String(entry.title || entry.key || ''),
+      type: String(entry.type || ''),
+      url: String(entry.url || ''),
+      key: String(entry.key || ''),
+    }))
+    .filter((entry) => entry.title || entry.key)
+    .slice(0, LIKES_LOG_LIMIT);
+}
+
 function sanitizeState(state) {
   const base = isObject(state) ? state : {};
   const merged = {
@@ -59,6 +104,12 @@ function sanitizeState(state) {
       reason: String((base.cooldown && base.cooldown.reason) || ''),
     },
     session: { ...DEFAULT_STATE.session, ...(isObject(base.session) ? base.session : {}) },
+    history: sanitizeHistory(base.history),
+    likes: sanitizeLikes(base.likes),
+    credentialReminder: {
+      ...DEFAULT_STATE.credentialReminder,
+      ...(isObject(base.credentialReminder) ? base.credentialReminder : {}),
+    },
     totals: { runs: clampNumber(base.totals && base.totals.runs, 0, 0), liked: clampNumber(base.totals && base.totals.liked, 0, 0) },
     lastRun: isObject(base.lastRun) ? base.lastRun : null,
     version: STATE_VERSION,
@@ -155,6 +206,35 @@ class Store {
     this.state.totals.runs += 1;
     this.state.totals.liked += clampNumber(summary.stats && summary.stats.liked, 0, 0);
     this.state.lastRun = summary;
+    this.state.history.unshift(compactHistoryEntry(summary));
+    if (this.state.history.length > HISTORY_LIMIT) {
+      this.state.history.length = HISTORY_LIMIT;
+    }
+  }
+
+  /** 点赞明细留档（新的在前），供控制台展示最近点赞列表。 */
+  recordLike(entry) {
+    this.state.likes.unshift({
+      at: entry && entry.at ? String(entry.at) : new Date().toISOString(),
+      title: String((entry && entry.title) || ''),
+      type: String((entry && entry.type) || ''),
+      url: String((entry && entry.url) || ''),
+      key: String((entry && entry.key) || ''),
+    });
+    if (this.state.likes.length > LIKES_LOG_LIMIT) {
+      this.state.likes.length = LIKES_LOG_LIMIT;
+    }
+  }
+
+  /** 凭证到期提醒的当日去重：没提醒过返回 true 并占住当天。 */
+  consumeCredentialReminderDay(daysLeft) {
+    const today = localDateKey(Date.now());
+    if (this.state.credentialReminder.lastWarnDate === today) {
+      return false;
+    }
+    this.state.credentialReminder.lastWarnDate = today;
+    this.state.credentialReminder.lastWarnDaysLeft = clampNumber(daysLeft, 0, 0);
+    return true;
   }
 }
 
@@ -225,5 +305,8 @@ module.exports = {
   readJsonSafe,
   acquireLock,
   releaseLock,
+  compactHistoryEntry,
   PROCESSED_CACHE_TTL_MS,
+  HISTORY_LIMIT,
+  LIKES_LOG_LIMIT,
 };

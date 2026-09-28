@@ -4,8 +4,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { evaluateItem } = require('../src/lib/rules');
-const { sanitizeState, resetDailyCounter, acquireLock } = require('../src/lib/store');
+const { sanitizeState, resetDailyCounter, acquireLock, Store, compactHistoryEntry, HISTORY_LIMIT, LIKES_LOG_LIMIT } = require('../src/lib/store');
 const { sanitizeConfig, DEFAULT_CONFIG } = require('../src/lib/config');
+const { isWithinActiveHours } = require('../src/lib/runner');
 
 function baseFilters(overrides = {}) {
   return {
@@ -157,4 +158,100 @@ test('jitterMsRange 会把区间规范化为非负且 min<=max', () => {
 test('jitterMsRange 为 [0,0] 时表示不抖动（不报错）', () => {
   const config = sanitizeConfig({ timing: { jitterMsRange: [0, 0] } });
   assert.deepEqual(config.timing.jitterMsRange, [0, 0]);
+});
+
+test('scrollRounds 缺省为 1，越界值会被夹到 [1,10]', () => {
+  assert.equal(sanitizeConfig({}).run.scrollRounds, 1);
+  assert.equal(sanitizeConfig({ run: { scrollRounds: 0 } }).run.scrollRounds, 1);
+  assert.equal(sanitizeConfig({ run: { scrollRounds: 3 } }).run.scrollRounds, 3);
+  assert.equal(sanitizeConfig({ run: { scrollRounds: 99 } }).run.scrollRounds, 10);
+});
+
+test('activeHours 非法时间会回退默认值，enabled 独立透传', () => {
+  const ok = sanitizeConfig({ schedule: { activeHours: { enabled: true, start: '9:30', end: '23:00' } } });
+  assert.equal(ok.schedule.activeHours.enabled, true);
+  assert.equal(ok.schedule.activeHours.start, '9:30');
+  assert.equal(ok.schedule.activeHours.end, '23:00');
+
+  const bad = sanitizeConfig({ schedule: { activeHours: { enabled: true, start: '上午', end: '25:00' } } });
+  assert.equal(bad.schedule.activeHours.start, DEFAULT_CONFIG.schedule.activeHours.start);
+  assert.equal(bad.schedule.activeHours.end, DEFAULT_CONFIG.schedule.activeHours.end);
+
+  assert.equal(sanitizeConfig({}).schedule.activeHours.enabled, false);
+});
+
+test('活跃时段：disabled 恒真；普通窗口两端包含', () => {
+  const at = (h, m) => new Date(2026, 8, 28, h, m);
+  const off = { activeHours: { enabled: false, start: '08:00', end: '23:59' } };
+  assert.equal(isWithinActiveHours(off, at(3, 0)), true);
+
+  const day = { activeHours: { enabled: true, start: '08:00', end: '23:59' } };
+  assert.equal(isWithinActiveHours(day, at(7, 59)), false);
+  assert.equal(isWithinActiveHours(day, at(8, 0)), true);
+  assert.equal(isWithinActiveHours(day, at(23, 59)), true);
+  assert.equal(isWithinActiveHours(day, at(0, 0)), false);
+});
+
+test('活跃时段：跨零点窗口（22:00~07:00）', () => {
+  const at = (h, m) => new Date(2026, 8, 28, h, m);
+  const night = { activeHours: { enabled: true, start: '22:00', end: '07:00' } };
+  assert.equal(isWithinActiveHours(night, at(23, 30)), true);
+  assert.equal(isWithinActiveHours(night, at(3, 0)), true);
+  assert.equal(isWithinActiveHours(night, at(7, 0)), true);
+  assert.equal(isWithinActiveHours(night, at(12, 0)), false);
+  assert.equal(isWithinActiveHours(night, at(21, 59)), false);
+});
+
+test('活跃时段：start==end 视为全天', () => {
+  const at = (h) => new Date(2026, 8, 28, h, 0);
+  const all = { activeHours: { enabled: true, start: '08:00', end: '08:00' } };
+  assert.equal(isWithinActiveHours(all, at(0)), true);
+  assert.equal(isWithinActiveHours(all, at(23)), true);
+});
+
+test('旧版 state（没有 history/likes 字段）加载后自动补默认结构', () => {
+  const state = sanitizeState({ processed: {}, totals: { runs: 3, liked: 5 } });
+  assert.deepEqual(state.history, []);
+  assert.deepEqual(state.likes, []);
+  assert.deepEqual(state.credentialReminder, { lastWarnDate: '' });
+  assert.equal(state.totals.runs, 3);
+});
+
+test('recordRun 会把摘要压进 history 环（新的在前，封顶 HISTORY_LIMIT）', () => {
+  const store = new Store(undefined); // 不落盘，直接操作内存 state
+  for (let i = 0; i < HISTORY_LIMIT + 5; i += 1) {
+    store.recordRun({
+      startedAt: new Date(2026, 8, 28, 0, i).toISOString(),
+      ok: i % 2 === 0,
+      stats: { scanned: 10, matched: 2, liked: i % 3, skipped: 8 },
+      durationMs: 5000,
+      jitterMs: 1000,
+      matchedItems: [{ title: 'x' }],
+    });
+  }
+  assert.equal(store.state.history.length, HISTORY_LIMIT);
+  assert.ok(store.state.history[0].at >= store.state.history[1].at, '新的在前');
+  assert.equal(store.state.history[0].matchedItems, undefined, '历史不带明细');
+  assert.equal(store.state.history[0].liked, (HISTORY_LIMIT + 4) % 3);
+});
+
+test('compactHistoryEntry 只保留画图需要的字段', () => {
+  const entry = compactHistoryEntry({ startedAt: '2026-09-28T00:00:00Z', ok: false, skipped: 'cooldown', stats: { scanned: 1, matched: 0, liked: 0, skipped: 1 }, durationMs: 12, jitterMs: 0, error: { message: 'x' } });
+  assert.deepEqual(Object.keys(entry).sort(), ['at', 'dryRun', 'durationMs', 'error', 'jitterMs', 'liked', 'matched', 'ok', 'scanned', 'skipped'].sort());
+});
+
+test('recordLike 留档新的在前，封顶 LIKES_LOG_LIMIT', () => {
+  const store = new Store(undefined);
+  for (let i = 0; i < LIKES_LOG_LIMIT + 5; i += 1) {
+    store.recordLike({ at: new Date(2026, 8, 28, 0, 0, i).toISOString(), title: `t${i}`, type: 'talks', url: 'u', key: `k${i}` });
+  }
+  assert.equal(store.state.likes.length, LIKES_LOG_LIMIT);
+  assert.equal(store.state.likes[0].key, `k${LIKES_LOG_LIMIT + 4}`);
+});
+
+test('凭证到期提醒每天只发一次', () => {
+  const store = new Store(undefined);
+  assert.equal(store.consumeCredentialReminderDay(10), true);
+  assert.equal(store.consumeCredentialReminderDay(9), false);
+  assert.equal(store.consumeCredentialReminderDay(9), false);
 });

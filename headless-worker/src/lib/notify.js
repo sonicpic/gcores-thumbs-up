@@ -114,6 +114,24 @@ function createNotifier(config, logger) {
       );
     },
 
+    /**
+     * 凭证临近过期提醒（每天最多一次，去重逻辑在 runner/store 侧）。
+     * 复用"登录失效时通知"开关：关心登录态的人两个都想要。
+     */
+    async credentialExpiring({ daysLeft, expiresAt }) {
+      if (!config.notifications.onSessionExpired) return false;
+      const expires = expiresAt ? new Date(expiresAt).toLocaleString('zh-CN', { hour12: false }) : '未知';
+      return send(
+        'GCORES 登录凭证即将到期',
+        buildLines('GCORES 登录凭证即将到期', [
+          ['时间', formatTimestamp()],
+          ['剩余', `约 ${daysLeft} 天`],
+          ['到期', expires],
+          ['处理', '请尽快执行 npm run gc:session:import 重新导入登录态，避免自动点赞中断'],
+        ])
+      );
+    },
+
     async runSummary({ stats, durationMs, dryRun }) {
       if (!config.notifications.onRunSummary) return false;
       return send(
