@@ -2,3 +2,7 @@ node_modules/
 .gcores-playwright/
 README.private.md
 config.local.json
+.agents/
+
+# 未脱敏的 WorkBuddy 对话原始导出（含 token/登录态，绝不入库）
+docs/workbuddy-archive/raw/

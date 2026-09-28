@@ -41,3 +41,13 @@ v0.2 的 Node 常驻守护进程方案（`scripts/gcores-playwright.js` +
 `scripts/gcores-daemon.js` + `scripts/lib/app-config.js`）已被上面的无头方案取代，
 连同它专用的根目录 `config.json` / `package.json` 一并删除。
 如需回看，可见提交历史。
+
+## 历史档案：`docs/workbuddy-archive/`
+
+本项目最初在 WorkBuddy 中开发（2026-09-21 完成从 RDP 依赖方案到无头方案的重构）。
+归档内容包括：
+
+- `conversation-2026-09-21-gcores-headless.md` —— 当天完整对话的**脱敏**导出
+  （需求、技术决策、环境坑都在里面；工具调用已省略）。
+- `workbuddy-memory-*.md` —— WorkBuddy 长期记忆快照（设计约束、常用操作、环境坑）。
+- `raw/`（gitignored）—— 未脱敏的原始 JSONL，只留在本地。
