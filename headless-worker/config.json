@@ -47,7 +47,8 @@
     "maxConsecutiveErrors": 3,
     "navigationRetries": 3,
     "maxRunMs": 300000,
-    "screenshotOnError": true
+    "screenshotOnError": true,
+    "scrollRounds": 1
   },
   "limits": {
     "maxLikesPerRun": 0,
@@ -66,7 +67,12 @@
   },
   "schedule": {
     "intervalMinutes": 30,
-    "taskName": "GcoresAutoLike"
+    "taskName": "GcoresAutoLike",
+    "activeHours": {
+      "enabled": true,
+      "start": "06:00",
+      "end": "01:00"
+    }
   },
   "notifications": {
     "enabled": true,
