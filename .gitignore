@@ -1,9 +1,7 @@
 node_modules/
 .gcores-playwright/
-README.private.md
 config.local.json
 .agents/
 
-# 个人归档（对话导出、迁移记录），不属于公开仓库内容
-docs/workbuddy-archive/
-tools/export-workbuddy-conversation.py
+# 开发者私有笔记：边角信息 / 个人叙事 / AI 会话总结，永不入库（见 dev-notes/README.md）
+dev-notes/
