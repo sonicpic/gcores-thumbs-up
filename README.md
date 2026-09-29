@@ -1,53 +1,44 @@
 # gcores-thumbs-up
 
-机核（GCORES）动态自动点赞工具集。
+自动给 [机核（GCORES）](https://www.gcores.com/) 动态点赞的工具集。
 
-仓库里有一套**正在使用**的实现，和一份**保留参考**的浏览器端脚本。
+仓库包含两个互补的组件：
 
-## 当前实现：`headless-worker/`
+| 组件 | 形态 | 适用场景 |
+| --- | --- | --- |
+| [`headless-worker/`](headless-worker/) | 无头浏览器 Worker + Windows 计划任务 | 无人值守，后台自动运行 |
+| [`gcores-feeds-auto-like.user.js`](gcores-feeds-auto-like.user.js) | Tampermonkey 用户脚本 | 浏览器端，开着机核页面时使用 |
 
-无人值守方案：无头 Chromium + 短生命周期进程，由 Windows 计划任务按间隔唤醒一轮，
-另配一个只监听本机的控制台页面。RDP 断开、注销、重启都不会让它停摆。
+## headless-worker
+
+![控制台截图](docs/images/console.png)
+
+无人值守的自动点赞方案，核心特点：
+
+- **不依赖桌面会话** —— 无头 Chromium 渲染，远程桌面断开、锁屏、注销都不影响运行；
+- **短生命周期进程** —— 每轮由 Windows 计划任务拉起，跑完即退，状态全部原子落盘，没有常驻进程，天然免疫崩溃与内存泄漏；
+- **拟人化节奏** —— 执行时刻随机抖动、动作间隔随机延迟、可配置活跃时段，避免行为过于规律；
+- **规则引擎** —— 按作者 / 话题 / 关键词 / 内容类型自由组合允许与屏蔽规则；
+- **安全边界** —— 单轮硬超时、连续失败熔断、HTTP 401/403/429 风控识别与自动冷却、每日点赞上限；
+- **本地控制台** —— 状态总览、趋势图表、最近点赞、实时日志（SSE）、可视化配置，零依赖单页面，只监听 `127.0.0.1`；
+- **通知** —— PushPlus 推送点赞结果、运行异常、登录态临期提醒。
+
+## 快速开始
 
 ```powershell
 cd headless-worker
 npm install
-npm run gc:task:install    # 注册计划任务（默认 30 分钟一轮）
-npm run gc:ui              # 打开本地控制台
-npm run gc:doctor          # 环境与登录态体检
+npm run gc:session:import   # 从本机浏览器导入机核登录态（一次性）
+npm run gc:task:install     # 注册 Windows 计划任务，默认每 30 分钟一轮
+npm run gc:ui               # 打开本地控制台
 ```
 
-完整的配置项、筛选规则、启停方式见 **[headless-worker/README.md](headless-worker/README.md)**。
+完整的安装说明、配置项与运行机制见 **[headless-worker/README.md](headless-worker/README.md)**。
 
-常用启停：
+## 用户脚本
 
-```powershell
-npm run gc:task:stop       # 停止（禁用）自动运行，任务保留
-npm run gc:task:start      # 恢复自动运行
-npm run gc:task:status     # 查看任务状态与最近日志
-```
+`gcores-feeds-auto-like.user.js`（v0.4.0）装进 Tampermonkey 即可使用：打开机核动态页时自动运行，自带可视化配置面板、点赞历史、随机限速与刷新倒计时。详见脚本文件头部的使用说明。
 
-## 保留参考：`gcores-feeds-auto-like.user.js`
+## 许可证
 
-Tampermonkey 油猴脚本（v0.4.0）。**浏览器端**使用：打开机核动态页时脚本自带
-可视化配置面板、点赞历史、随机限速与刷新倒计时。
-
-它和 `headless-worker/` 是两种不同的使用方式（前者要开着浏览器，后者无人值守），
-并不冲突，因此保留。用不用随你。
-
-## 已移除
-
-v0.2 的 Node 常驻守护进程方案（`scripts/gcores-playwright.js` +
-`scripts/gcores-daemon.js` + `scripts/lib/app-config.js`）已被上面的无头方案取代，
-连同它专用的根目录 `config.json` / `package.json` 一并删除。
-如需回看，可见提交历史。
-
-## 历史档案：`docs/workbuddy-archive/`
-
-本项目最初在 WorkBuddy 中开发（2026-09-21 完成从 RDP 依赖方案到无头方案的重构）。
-归档内容包括：
-
-- `conversation-2026-09-21-gcores-headless.md` —— 当天完整对话的**脱敏**导出
-  （需求、技术决策、环境坑都在里面；工具调用已省略）。
-- `workbuddy-memory-*.md` —— WorkBuddy 长期记忆快照（设计约束、常用操作、环境坑）。
-- `raw/`（gitignored）—— 未脱敏的原始 JSONL，只留在本地。
+[MIT](LICENSE)

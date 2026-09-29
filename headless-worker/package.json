@@ -3,9 +3,17 @@
   "private": true,
   "version": "0.3.0",
   "description": "GCORES feeds auto-like automation: headless Playwright worker scheduled by Windows Task Scheduler",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sonicpic/gcores-thumbs-up.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sonicpic/gcores-thumbs-up/issues"
+  },
   "main": "src/cli.js",
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=18"
   },
   "scripts": {
     "gc:run": "node src/cli.js run",

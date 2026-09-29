@@ -4,5 +4,6 @@ README.private.md
 config.local.json
 .agents/
 
-# 未脱敏的 WorkBuddy 对话原始导出（含 token/登录态，绝不入库）
-docs/workbuddy-archive/raw/
+# 个人归档（对话导出、迁移记录），不属于公开仓库内容
+docs/workbuddy-archive/
+tools/export-workbuddy-conversation.py
